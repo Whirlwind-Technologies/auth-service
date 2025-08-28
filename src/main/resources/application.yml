@@ -1,0 +1,226 @@
+server:
+  port: 8081
+  servlet:
+    context-path: /auth-service
+
+spring:
+  application:
+    name: auth-service
+
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/auth_db}
+    username: ${DB_USERNAME:auth_user}
+    password: ${DB_PASSWORD:auth_pass}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+        show_sql: false
+        jdbc:
+          batch_size: 25
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+
+  # Redis Cache Configuration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+  session:
+    store-type: redis
+    redis:
+      flush-mode: on_save
+      namespace: auth:session
+
+  cache:
+    type: redis
+    redis:
+      time-to-live: ${CACHE_TTL:3600000}
+      cache-null-values: false
+
+# Security Configuration
+security:
+  jwt:
+    secret: ${JWT_SECRET:dGhpcyBpcyBhIDUxMi1iaXQgc2VjcmV0IGtleSBmb3IgSFM1MTIgand0IHNpZ25pbmcgYWxnb3JpdGhtIGVuY29kZWQgaW4gYmFzZTY0IGZvcm1hdCB0aGF0IHlvdSBjYW4gdXNlIGZvciBzZWN1cmUgdG9rZW4=}
+    access-token-expiration: ${JWT_ACCESS_EXPIRATION:900000} # 15 minutes
+    refresh-token-expiration: ${JWT_REFRESH_EXPIRATION:604800000} # 7 days
+    issuer: ${JWT_ISSUER:https://nnipa.cloud}
+
+  oauth2:
+    client:
+      registration:
+        google:
+          client-id: ${GOOGLE_CLIENT_ID:}
+          client-secret: ${GOOGLE_CLIENT_SECRET:}
+          scope: openid, profile, email
+
+        github:
+          client-id: ${GITHUB_CLIENT_ID:}
+          client-secret: ${GITHUB_CLIENT_SECRET:}
+          scope: user:email, read:user
+
+        microsoft:
+          client-id: ${MICROSOFT_CLIENT_ID:}
+          client-secret: ${MICROSOFT_CLIENT_SECRET:}
+          scope: openid, profile, email
+
+  saml:
+    entity-id: ${SAML_ENTITY_ID:https://nnipa.cloud/auth}
+    base-url: ${SAML_BASE_URL:https://nnipa.cloud/auth-service}
+    keystore:
+      location: ${SAML_KEYSTORE_LOCATION:classpath:saml/keystore.jks}
+      password: ${SAML_KEYSTORE_PASSWORD:}
+      alias: ${SAML_KEY_ALIAS:nnipa}
+
+  password:
+    policy:
+      min-length: ${PASSWORD_MIN_LENGTH:12}
+      require-uppercase: ${PASSWORD_REQUIRE_UPPERCASE:true}
+      require-lowercase: ${PASSWORD_REQUIRE_LOWERCASE:true}
+      require-digit: ${PASSWORD_REQUIRE_DIGIT:true}
+      require-special: ${PASSWORD_REQUIRE_SPECIAL:true}
+      max-age-days: ${PASSWORD_MAX_AGE:90}
+      history-count: ${PASSWORD_HISTORY:5}
+
+  mfa:
+    enabled: ${MFA_ENABLED:true}
+    issuer: ${MFA_ISSUER:NNIPA Platform}
+    totp:
+      time-step: 30
+      window: 3
+      digits: 6
+    sms:
+      provider: ${SMS_PROVIDER:twilio}
+      twilio:
+        account-sid: ${TWILIO_ACCOUNT_SID:}
+        auth-token: ${TWILIO_AUTH_TOKEN:}
+        from-number: ${TWILIO_FROM_NUMBER:}
+
+  session:
+    timeout: ${SESSION_TIMEOUT:1800} # 30 minutes
+    max-concurrent: ${MAX_CONCURRENT_SESSIONS:3}
+    remember-me: ${REMEMBER_ME_ENABLED:true}
+    remember-me-duration: ${REMEMBER_ME_DURATION:1209600} # 14 days
+
+# Rate Limiting
+rate-limiting:
+  enabled: true
+  login-attempts:
+    max-attempts: ${MAX_LOGIN_ATTEMPTS:5}
+    block-duration: ${LOGIN_BLOCK_DURATION:900} # 15 minutes
+  token-generation:
+    max-per-minute: ${MAX_TOKENS_PER_MINUTE:10}
+
+# Service Integration
+services:
+  tenant-service:
+    url: ${TENANT_SERVICE_URL:http://localhost:8080}
+    timeout: 5000
+  authorization-service:
+    url: ${AUTHZ_SERVICE_URL:http://localhost:8082}
+    timeout: 3000
+  notification-service:
+    url: ${NOTIFICATION_SERVICE_URL:http://localhost:8085}
+    timeout: 3000
+
+# Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.nnipa.auth: DEBUG
+    org.springframework.security: DEBUG
+    org.springframework.security.oauth2: DEBUG
+
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+  file:
+    name: logs/auth-service.log
+    max-size: 10MB
+    max-history: 30
+
+# Resilience4j Circuit Breaker
+resilience4j:
+  circuitbreaker:
+    instances:
+      tenant-service:
+        slidingWindowSize: 10
+        permittedNumberOfCallsInHalfOpenState: 3
+        slidingWindowType: COUNT_BASED
+        minimumNumberOfCalls: 5
+        waitDurationInOpenState: 10s
+        failureRateThreshold: 50
+
+      authorization-service:
+        slidingWindowSize: 10
+        permittedNumberOfCallsInHalfOpenState: 3
+        slidingWindowType: COUNT_BASED
+        minimumNumberOfCalls: 5
+        waitDurationInOpenState: 10s
+        failureRateThreshold: 50
+
+  retry:
+    instances:
+      tenant-service:
+        maxAttempts: 3
+        waitDuration: 1s
+
+      authorization-service:
+        maxAttempts: 3
+        waitDuration: 1s
+
+# API Documentation
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+    operationsSorter: method
