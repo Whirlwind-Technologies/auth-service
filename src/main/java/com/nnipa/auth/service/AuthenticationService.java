@@ -23,9 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -496,6 +494,14 @@ public class AuthenticationService {
     }
 
     private AuthResponse buildAuthResponse(User user, String accessToken, String refreshToken) {
+        // Safely get linked providers
+        Set<String> linkedProviders = new HashSet<>();
+        if (user.getOauth2Accounts() != null) {
+            linkedProviders = user.getOauth2Accounts().stream()
+                    .map(account -> account.getProvider().toString())
+                    .collect(Collectors.toSet());
+        }
+
         UserInfoResponse userInfo = UserInfoResponse.builder()
                 .id(user.getId())
                 .tenantId(user.getTenantId())
@@ -509,9 +515,7 @@ public class AuthenticationService {
                 .primaryAuthProvider(user.getPrimaryAuthProvider())
                 .mfaEnabled(user.getMfaEnabled())
                 .lastLoginAt(user.getLastLoginAt())
-                .linkedProviders(user.getOauth2Accounts().stream()
-                        .map(account -> account.getProvider().toString())
-                        .collect(Collectors.toSet()))
+                .linkedProviders(linkedProviders)
                 .createdAt(user.getCreatedAt())
                 .build();
 
