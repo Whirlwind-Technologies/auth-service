@@ -8,9 +8,9 @@ import com.nnipa.auth.dto.response.TokenResponse;
 import com.nnipa.auth.dto.response.UserInfoResponse;
 import com.nnipa.auth.entity.*;
 import com.nnipa.auth.enums.*;
+import com.nnipa.auth.event.AuthEventPublisher;
 import com.nnipa.auth.exception.AuthenticationException;
 import com.nnipa.auth.exception.InvalidTokenException;
-import com.nnipa.auth.integration.NotificationServiceClient;
 import com.nnipa.auth.repository.*;
 import com.nnipa.auth.security.jwt.JwtTokenProvider;
 import lombok.RequiredArgsConstructor;
@@ -43,8 +43,8 @@ public class AuthenticationService {
     private final SessionService sessionService;
     private final RateLimitingService rateLimitingService;
     private final AuditService auditService;
-    private final NotificationServiceClient notificationService;
     private final MfaService mfaService;
+    private final AuthEventPublisher authEventPublisher;
 
     /**
      * Authenticate user with username/password.
@@ -128,13 +128,16 @@ public class AuthenticationService {
                 true, ipAddress, userAgent, Map.of("method", "password")
         );
 
-        // Send new device notification if needed
-        if (isNewDevice) {
-            notificationService.sendNewDeviceLoginNotification(user, userAgent, ipAddress);
-        }
+        // Record successful login
+        recordSuccessfulLogin(user, ipAddress, userAgent);
 
         // Create session
         createUserSession(user, refreshToken, ipAddress, userAgent, request.getDeviceInfo());
+
+        // Create session
+        if (request.getRememberMe()) {
+            sessionService.createRememberMeSession(user.getId(), refreshToken);
+        }
 
         return buildAuthResponse(user, accessToken, refreshToken);
     }
@@ -194,6 +197,13 @@ public class AuthenticationService {
         user.setActivationToken(activationToken);
         user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
         userRepository.save(user);
+
+        // Publish user registered event to Kafka
+        // The notification service will consume this event and send the activation email
+        authEventPublisher.publishUserRegisteredEvent(user, activationToken);
+
+        log.info("UserRegisteredEvent published for user: {}", user.getId());
+
 
         // Generate tokens for immediate login (optional)
         String accessToken = jwtTokenProvider.generateAccessToken(user);

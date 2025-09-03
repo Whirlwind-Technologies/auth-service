@@ -7,7 +7,6 @@ import com.nnipa.auth.entity.User;
 import com.nnipa.auth.entity.UserCredential;
 import com.nnipa.auth.enums.UserStatus;
 import com.nnipa.auth.exception.AuthenticationException;
-import com.nnipa.auth.integration.NotificationServiceClient;
 import com.nnipa.auth.repository.PasswordHistoryRepository;
 import com.nnipa.auth.repository.PasswordResetTokenRepository;
 import com.nnipa.auth.repository.UserCredentialRepository;
@@ -17,7 +16,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.passay.*;
 import org.passay.dictionary.ArrayWordList;
 import org.passay.dictionary.WordListDictionary;
-import org.passay.dictionary.sort.ArraysSort;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -26,7 +24,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Service for password management and policy enforcement.
@@ -42,7 +39,6 @@ public class PasswordService {
     private final PasswordResetTokenRepository passwordResetTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final SecurityProperties securityProperties;
-    private final NotificationServiceClient notificationService;
 
     /**
      * Validate password against configured policies.
@@ -182,7 +178,7 @@ public class PasswordService {
         userRepository.save(user);
 
         // Send notification (would integrate with notification-service)
-        notificationService.sendPasswordChangeNotification(user);
+//        notificationService.sendPasswordChangeNotification(user);
 
         log.info("Password changed successfully for user: {}", userId);
     }
@@ -211,7 +207,7 @@ public class PasswordService {
         passwordResetTokenRepository.save(token);
 
         // Send reset email (would integrate with notification-service)
-        notificationService.sendPasswordResetEmail(user, resetToken);
+//        notificationService.sendPasswordResetEmail(user, resetToken);
 
         log.info("Password reset email sent to: {}", email);
     }
@@ -288,7 +284,7 @@ public class PasswordService {
         passwordResetTokenRepository.save(resetToken);
 
         // Send confirmation email
-        notificationService.sendPasswordResetConfirmation(user);
+//        notificationService.sendPasswordResetConfirmation(user);
 
         log.info("Password reset successfully for user: {}", user.getId());
 

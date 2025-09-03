@@ -1,5 +1,5 @@
 server:
-  port: 8081
+  port: 8082
   servlet:
     context-path: /auth-service
 
@@ -51,6 +51,8 @@ spring:
           max-active: 8
           max-idle: 8
           min-idle: 0
+      repositories:
+        enabled: false
 
   session:
     store-type: redis
@@ -63,6 +65,46 @@ spring:
     redis:
       time-to-live: ${CACHE_TTL:3600000}
       cache-null-values: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BROKERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer
+      acks: all
+      retries: 3
+      properties:
+        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+        auto.register.schemas: true
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+        compression.type: snappy
+        linger.ms: 10
+        batch.size: 32768
+    consumer:
+      group-id: notification-service
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: io.confluent.kafka.serializers.protobuf.KafkaProtobufDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+        specific.protobuf.value.type: com.google.protobuf.DynamicMessage
+        isolation.level: read_committed
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+        max.poll.records: 10
+        max.poll.interval.ms: 300000
+
+# Event Topics Configuration
+auth:
+  kafka:
+    topics:
+      user-registered: nnipa.events.auth.user-registered
+      password-changed: nnipa.events.auth.password-changed
+      login-event: nnipa.events.auth.login
+      mfa-event: nnipa.events.auth.mfa
+      security-alert: nnipa.events.auth.security-alert
 
 # Security Configuration
 security:

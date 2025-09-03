@@ -7,13 +7,13 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.annotation.Bean;
 import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.session.data.redis.config.annotation.web.http.EnableRedisHttpSession;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
-import org.springframework.web.client.RestTemplate;
 
 /**
  * Main application class for the Authentication Service.
@@ -38,6 +38,7 @@ import org.springframework.web.client.RestTemplate;
 @EnableScheduling
 @EnableTransactionManagement
 @EnableRedisHttpSession
+@EnableJpaRepositories(basePackages = "com.nnipa.auth.repository")
 @ConfigurationPropertiesScan("com.nnipa.auth.config")
 public class AuthServiceApplication {
 
@@ -77,12 +78,4 @@ public class AuthServiceApplication {
         return new BCryptPasswordEncoder(12);
     }
 
-    /**
-     * RestTemplate for inter-service communication.
-     * Used to communicate with tenant, authorization, and notification services.
-     */
-    @Bean
-    public RestTemplate restTemplate() {
-        return new RestTemplate();
-    }
 }
