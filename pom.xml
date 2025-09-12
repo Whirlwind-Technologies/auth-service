@@ -16,7 +16,7 @@
     <artifactId>auth-service</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <name>auth-service</name>
-    <description>Authentication Service for NNIPA Platform - Handles OAuth 2.0, SAML, OpenID Connect, JWT, MFA</description>
+    <description>Authentication Service for NNIPA Platform - Handles OAuth 2.0, SAML, OpenID Connect, JWT, MFA.</description>
 
     <properties>
         <java.version>21</java.version>
@@ -81,6 +81,11 @@
             <artifactId>spring-boot-starter-oauth2-client</artifactId>
         </dependency>
 
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
         <!-- OAuth2 Authorization Server (compatible with Spring Boot 3.5.5) -->
         <dependency>
             <groupId>org.springframework.security</groupId>
@@ -105,52 +110,11 @@
             <version>${kafka.version}</version>
         </dependency>
 
-        <!-- NNIPA Proto Library with gRPC exclusions -->
+        <!-- NNIPA Proto Library -->
         <dependency>
             <groupId>com.nnipa</groupId>
             <artifactId>nnipa-protos</artifactId>
-            <version>1.0.0</version>
-            <exclusions>
-                <!-- Exclude gRPC server dependencies -->
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-netty-shaded</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-protobuf</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-stub</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-core</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-api</artifactId>
-                </exclusion>
-                <!-- Exclude Spring Boot gRPC starters if present -->
-                <exclusion>
-                    <groupId>net.devh</groupId>
-                    <artifactId>grpc-server-spring-boot-starter</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>net.devh</groupId>
-                    <artifactId>grpc-client-spring-boot-starter</artifactId>
-                </exclusion>
-                <!-- Exclude other potential gRPC-related dependencies -->
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-services</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-context</artifactId>
-                </exclusion>
-            </exclusions>
+            <version>1.0.0-SNAPSHOT</version>
         </dependency>
 
         <!-- Protocol Buffers -->
@@ -356,6 +320,7 @@
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+
     </dependencies>
 
     <dependencyManagement>

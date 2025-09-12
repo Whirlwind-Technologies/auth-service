@@ -1,5 +1,6 @@
 package com.nnipa.auth.service;
 
+import com.nnipa.auth.client.TenantServiceClient;
 import com.nnipa.auth.dto.request.LoginRequest;
 import com.nnipa.auth.dto.request.RefreshTokenRequest;
 import com.nnipa.auth.dto.request.RegisterRequest;
@@ -17,14 +18,21 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.nnipa.auth.enums.RegistrationType;
+import org.springframework.kafka.support.SendResult;
+
 
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Core authentication service handling login, registration, and token management.
@@ -45,6 +53,7 @@ public class AuthenticationService {
     private final AuditService auditService;
     private final MfaService mfaService;
     private final AuthEventPublisher authEventPublisher;
+    private final TenantServiceClient tenantServiceClient;
 
     /**
      * Authenticate user with username/password.
@@ -143,11 +152,12 @@ public class AuthenticationService {
     }
 
     /**
-     * Register new user.
+     * Register new user - routes to appropriate flow based on registration type.
      */
     @Transactional
     public AuthResponse register(RegisterRequest request, String ipAddress) {
-        log.info("Registering new user: {}", request.getEmail());
+        log.info("Processing registration for email: {} with type: {}",
+                request.getEmail(), request.getRegistrationType());
 
         // Validate passwords match
         if (!request.getPassword().equals(request.getConfirmPassword())) {
@@ -159,21 +169,39 @@ public class AuthenticationService {
             throw new AuthenticationException("Email already registered");
         }
 
-        if (request.getUsername() != null && userRepository.existsByUsername(request.getUsername())) {
+        if (request.getUsername() != null &&
+                userRepository.existsByUsername(request.getUsername())) {
             throw new AuthenticationException("Username already taken");
         }
 
-        // Get tenant ID (would integrate with tenant-service here)
-        UUID tenantId = getTenantIdFromCode(request.getTenantCode());
+        // Route to appropriate registration flow
+        if (request.getRegistrationType() == RegistrationType.SELF_SIGNUP) {
+            return processSelfSignup(request, ipAddress);
+        } else {
+            return processAdminCreatedUser(request, ipAddress);
+        }
+    }
 
-        // Create user
+    /**
+     * Process self-signup (new tenant creation).
+     */
+    private AuthResponse processSelfSignup(RegisterRequest request, String ipAddress) {
+        log.info("Processing self-signup for new organization: {}", request.getOrganizationName());
+
+        // Validate organization info for self-signup
+        if (request.getOrganizationName() == null || request.getOrganizationName().trim().isEmpty()) {
+            throw new AuthenticationException("Organization name is required for self-signup");
+        }
+
+        // Step 1: Create user identity (without tenant ID initially)
         User user = User.builder()
-                .tenantId(tenantId)
                 .username(request.getUsername())
                 .email(request.getEmail())
                 .emailVerified(false)
                 .phoneNumber(request.getPhoneNumber())
                 .phoneVerified(false)
+                .firstName(request.getFirstName())
+                .lastName(request.getLastName())
                 .status(UserStatus.PENDING_ACTIVATION)
                 .primaryAuthProvider(AuthProvider.LOCAL)
                 .mfaEnabled(request.getEnableMfa())
@@ -192,25 +220,184 @@ public class AuthenticationService {
 
         credentialRepository.save(credential);
 
-        // Generate activation token (would send via notification-service)
+        // Generate activation token
         String activationToken = UUID.randomUUID().toString();
         user.setActivationToken(activationToken);
         user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
         userRepository.save(user);
 
-        // Publish user registered event to Kafka
-        // The notification service will consume this event and send the activation email
-        authEventPublisher.publishUserRegisteredEvent(user, activationToken);
+        // Step 2: Publish self-signup event
+        // This triggers the orchestration:
+        // 1. Tenant-service creates tenant and assigns user as owner
+        // 2. User-service creates profile
+        // 3. Authorization-service assigns "TENANT_OWNER" role
+        authEventPublisher.publishSelfSignupEvent(
+                user,
+                activationToken,
+                request.getOrganizationName(),
+                request.getOrganizationType()
+        );
 
-        log.info("UserRegisteredEvent published for user: {}", user.getId());
+        // Step 3: Send create tenant command and wait for tenant ID
+        CompletableFuture<SendResult<String, byte[]>> tenantFuture =
+                authEventPublisher.sendCreateTenantCommand(
+                        user.getId(),
+                        request.getOrganizationName(),
+                        request.getOrganizationType(),
+                        request.getOrganizationEmail() != null ?
+                                request.getOrganizationEmail() : request.getEmail()
+                );
 
+        try {
+            // Wait for tenant creation (with timeout)
+            tenantFuture.get(5, TimeUnit.SECONDS);
+
+            // Note: In a production system, you might want to:
+            // 1. Use a correlation ID to track the command
+            // 2. Listen for a TenantCreatedEvent to get the tenant ID
+            // 3. Update the user with the tenant ID asynchronously
+
+        } catch (Exception e) {
+            log.error("Error during tenant creation command", e);
+            // Continue anyway - tenant will be created asynchronously
+        }
+
+        // Log successful registration
+        auditService.logAuthenticationEvent(
+                user.getId(), null, AuditEventType.USER_REGISTERED,
+                true, ipAddress, null, Map.of(
+                        "type", "self_signup",
+                        "organization", request.getOrganizationName()
+                )
+        );
 
         // Generate tokens for immediate login (optional)
         String accessToken = jwtTokenProvider.generateAccessToken(user);
         String refreshToken = createRefreshToken(user, null, ipAddress, null);
 
-        return buildAuthResponse(user, accessToken, refreshToken);
+        return AuthResponse.builder()
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .tokenType("Bearer")
+                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
+                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
+                .user(UserInfoResponse.builder()
+                        .id(user.getId())
+                        .email(user.getEmail())
+                        .username(user.getUsername())
+                        .build())
+                .authenticatedAt(LocalDateTime.now())
+                .build();
     }
+
+    /**
+     * Process admin-created user (existing tenant).
+     */
+    private AuthResponse processAdminCreatedUser(RegisterRequest request, String ipAddress) {
+        log.info("Processing admin-created user for tenant: {}", request.getTenantId());
+
+        // Validate tenant ID for admin-created users
+        if (request.getTenantId() == null || request.getTenantId().trim().isEmpty()) {
+            throw new AuthenticationException("Tenant ID is required for admin-created users");
+        }
+
+        UUID tenantId = UUID.fromString(request.getTenantId());
+
+        // Verify tenant exists (call tenant-service)
+        if (!tenantServiceClient.tenantExists(tenantId)) {
+            throw new AuthenticationException("Invalid tenant ID");
+        }
+
+        // Step 1: Create user identity with tenant association
+        User user = User.builder()
+                .tenantId(tenantId)
+                .username(request.getUsername())
+                .email(request.getEmail())
+                .emailVerified(false)
+                .phoneNumber(request.getPhoneNumber())
+                .phoneVerified(false)
+                .firstName(request.getFirstName())
+                .lastName(request.getLastName())
+                .status(UserStatus.PENDING_ACTIVATION)
+                .primaryAuthProvider(AuthProvider.LOCAL)
+                .mfaEnabled(request.getEnableMfa())
+                .build();
+
+        user = userRepository.save(user);
+
+        // Create credentials
+        UserCredential credential = UserCredential.builder()
+                .user(user)
+                .passwordHash(passwordEncoder.encode(request.getPassword()))
+                .passwordExpiresAt(LocalDateTime.now().plusDays(90))
+                .mustChangePassword(true) // Admin-created users must change password
+                .failedAttempts(0)
+                .build();
+
+        credentialRepository.save(credential);
+
+        // Generate activation token
+        String activationToken = UUID.randomUUID().toString();
+        user.setActivationToken(activationToken);
+        user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
+        userRepository.save(user);
+
+        // Get admin user ID from security context
+        String createdBy = getCurrentUserId() != null ?
+                getCurrentUserId().toString() : "system";
+
+        // Step 2: Publish admin-created user event
+        authEventPublisher.publishAdminCreatedUserEvent(user, activationToken, createdBy);
+
+        // Step 3: Send commands to other services
+        // Create user profile
+        authEventPublisher.sendCreateUserProfileCommand(
+                user.getId(),
+                tenantId,
+                user.getEmail(),
+                request.getFirstName(),
+                request.getLastName()
+        );
+
+        // Assign role
+        String role = request.getInitialRole() != null ?
+                request.getInitialRole() : "MEMBER";
+        authEventPublisher.sendAssignRoleCommand(user.getId(), tenantId, role);
+
+        // Log successful registration
+        auditService.logAuthenticationEvent(
+                user.getId(), tenantId, AuditEventType.USER_REGISTERED,
+                true, ipAddress, null, Map.of(
+                        "type", "admin_created",
+                        "created_by", createdBy,
+                        "initial_role", role
+                )
+        );
+
+        // For admin-created users, don't generate tokens immediately
+        // They need to activate their account first
+        return AuthResponse.builder()
+                .user(UserInfoResponse.builder()
+                        .id(user.getId())
+                        .email(user.getEmail())
+                        .username(user.getUsername())
+                        .build())
+                .authenticatedAt(LocalDateTime.now())
+                .build();
+    }
+
+    /**
+     * Get current authenticated user ID.
+     */
+    private UUID getCurrentUserId() {
+        // Get from Spring Security context
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication != null && authentication.getPrincipal() instanceof UUID) {
+            return (UUID) authentication.getPrincipal();
+        }
+        return null;
+    }
+
 
     /**
      * Complete MFA authentication.

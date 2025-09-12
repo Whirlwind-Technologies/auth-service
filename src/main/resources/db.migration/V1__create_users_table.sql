@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
     tenant_id UUID NOT NULL,
     external_user_id UUID,
     username VARCHAR(100) UNIQUE,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
     email VARCHAR(255) NOT NULL UNIQUE,
     email_verified BOOLEAN NOT NULL DEFAULT FALSE,
     phone_number VARCHAR(20),
