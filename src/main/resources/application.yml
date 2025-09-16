@@ -1,5 +1,5 @@
 server:
-  port: 8082
+  port: 4002
   servlet:
     context-path: /auth-service
 
@@ -11,7 +11,7 @@ spring:
     active: ${SPRING_PROFILES_ACTIVE:dev}
 
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/auth_db}
+    url: ${DB_URL:jdbc:postgresql://localhost:5002/auth_db_dev}
     username: ${DB_USERNAME:auth_user}
     password: ${DB_PASSWORD:auth_pass}
     driver-class-name: org.postgresql.Driver
@@ -258,11 +258,16 @@ resilience4j:
         maxAttempts: 3
         waitDuration: 1s
 
-# API Documentation
+# OpenAPI/Swagger Configuration
 springdoc:
   api-docs:
+    enabled: ${API_DOCS_ENABLED:true}
     path: /api-docs
   swagger-ui:
+    enabled: ${SWAGGER_UI_ENABLED:true}
     path: /swagger-ui.html
-    enabled: true
-    operationsSorter: method
+    try-it-out-enabled: false
+    filter: true
+    operations-sorter: method
+    tags-sorter: alpha
+  show-actuator: false

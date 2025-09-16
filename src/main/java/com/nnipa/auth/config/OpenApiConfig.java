@@ -60,7 +60,7 @@ public class OpenApiConfig {
         String basePath = StringUtils.hasText(contextPath) ? contextPath : "";
 
         Server localServer = new Server()
-                .url("http://localhost:8081" + basePath)
+                .url("http://localhost:4002" + basePath)
                 .description("Local Development Server");
 
         Server devServer = new Server()
@@ -99,8 +99,8 @@ public class OpenApiConfig {
                                 .description("OAuth 2.0 Authentication")
                                 .flows(new OAuthFlows()
                                         .authorizationCode(new OAuthFlow()
-                                                .authorizationUrl("http://localhost:8081" + basePath + "/oauth/authorize")
-                                                .tokenUrl("http://localhost:8081" + basePath + "/oauth/token")
+                                                .authorizationUrl("http://localhost:4002" + basePath + "/oauth/authorize")
+                                                .tokenUrl("http://localhost:4002" + basePath + "/oauth/token")
                                                 .scopes(new Scopes()
                                                         .addString("read", "Read access")
                                                         .addString("write", "Write access")))));

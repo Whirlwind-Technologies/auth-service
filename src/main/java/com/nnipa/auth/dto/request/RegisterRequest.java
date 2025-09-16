@@ -23,6 +23,9 @@ public class RegisterRequest {
     @Schema(description = "Tenant ID for admin-created users (required for ADMIN_CREATED type)")
     private String tenantId;
 
+    @Schema(description = "Tenant Code")
+    private String tenantCode;
+
     // For SELF_SIGNUP type - new tenant info
     @Schema(description = "Organization name (required for SELF_SIGNUP type)")
     private String organizationName;

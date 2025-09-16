@@ -16,7 +16,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * JWT token provider for generating and validating JWT tokens.
+ * JWT token provider - fixed version with correlation ID support
  */
 @Slf4j
 @Component
@@ -26,9 +26,9 @@ public class JwtTokenProvider {
     private final SecurityProperties securityProperties;
 
     /**
-     * Generate access token for authenticated user.
+     * Generate access token with correlation ID.
      */
-    public String generateAccessToken(User user) {
+    public String generateAccessToken(User user, String correlationId) {
         Date now = new Date();
         Date expiryDate = new Date(now.getTime() + securityProperties.getJwt().getAccessTokenExpiration());
 
@@ -41,6 +41,39 @@ public class JwtTokenProvider {
         claims.put("mfaEnabled", user.getMfaEnabled());
         claims.put("authProvider", user.getPrimaryAuthProvider().toString());
         claims.put("type", "access");
+        claims.put("correlationId", correlationId);
+
+        return Jwts.builder()
+                .claims(claims)
+                .subject(user.getId().toString())
+                .issuer(securityProperties.getJwt().getIssuer())
+                .issuedAt(now)
+                .expiration(expiryDate)
+                .id(UUID.randomUUID().toString())
+                .signWith(getSigningKey(), Jwts.SIG.HS512)
+                .compact();
+    }
+
+    /**
+     * Generate access token without correlation ID (backward compatibility).
+     */
+    public String generateAccessToken(User user) {
+        return generateAccessToken(user, UUID.randomUUID().toString());
+    }
+
+    /**
+     * Generate MFA token with correlation ID.
+     */
+    public String generateMfaToken(User user, String correlationId) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + 300000); // 5 minutes
+
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("userId", user.getId().toString());
+        claims.put("tenantId", user.getTenantId().toString());
+        claims.put("type", "mfa");
+        claims.put("purpose", "mfa_verification");
+        claims.put("correlationId", correlationId);
 
         return Jwts.builder()
                 .claims(claims)
@@ -76,73 +109,33 @@ public class JwtTokenProvider {
                 .compact();
     }
 
-    /**
-     * Generate MFA token for two-factor authentication.
-     */
-    public String generateMfaToken(User user) {
-        Date now = new Date();
-        Date expiryDate = new Date(now.getTime() + 300000); // 5 minutes
+    // ... rest of the methods remain the same ...
 
-        Map<String, Object> claims = new HashMap<>();
-        claims.put("userId", user.getId().toString());
-        claims.put("tenantId", user.getTenantId().toString());
-        claims.put("type", "mfa");
-        claims.put("purpose", "mfa_verification");
-
-        return Jwts.builder()
-                .claims(claims)
-                .subject(user.getId().toString())
-                .issuer(securityProperties.getJwt().getIssuer())
-                .issuedAt(now)
-                .expiration(expiryDate)
-                .id(UUID.randomUUID().toString())
-                .signWith(getSigningKey(), Jwts.SIG.HS512)
-                .compact();
-    }
-
-    /**
-     * Extract user ID from token.
-     */
     public UUID getUserIdFromToken(String token) {
         Claims claims = getClaims(token);
         return UUID.fromString(claims.get("userId", String.class));
     }
 
-    /**
-     * Extract tenant ID from token.
-     */
     public UUID getTenantIdFromToken(String token) {
         Claims claims = getClaims(token);
         return UUID.fromString(claims.get("tenantId", String.class));
     }
 
-    /**
-     * Extract username from token.
-     */
     public String getUsernameFromToken(String token) {
         Claims claims = getClaims(token);
         return claims.get("username", String.class);
     }
 
-    /**
-     * Extract JWT ID from token.
-     */
     public String getJtiFromToken(String token) {
         Claims claims = getClaims(token);
         return claims.getId();
     }
 
-    /**
-     * Get token type (access, refresh, mfa).
-     */
     public String getTokenType(String token) {
         Claims claims = getClaims(token);
         return claims.get("type", String.class);
     }
 
-    /**
-     * Validate JWT token.
-     */
     public boolean validateToken(String token) {
         try {
             Jwts.parser()
@@ -164,9 +157,6 @@ public class JwtTokenProvider {
         return false;
     }
 
-    /**
-     * Check if token is expired.
-     */
     public boolean isTokenExpired(String token) {
         try {
             Claims claims = getClaims(token);
@@ -179,17 +169,11 @@ public class JwtTokenProvider {
         }
     }
 
-    /**
-     * Get expiration date from token.
-     */
     public Date getExpirationDateFromToken(String token) {
         Claims claims = getClaims(token);
         return claims.getExpiration();
     }
 
-    /**
-     * Get all claims from token.
-     */
     public Claims getClaims(String token) {
         return Jwts.parser()
                 .verifyWith(getSigningKey())
@@ -198,24 +182,15 @@ public class JwtTokenProvider {
                 .getPayload();
     }
 
-    /**
-     * Get signing key from configuration.
-     */
     private SecretKey getSigningKey() {
         byte[] keyBytes = securityProperties.getJwt().getSecret().getBytes(StandardCharsets.UTF_8);
         return Keys.hmacShaKeyFor(keyBytes);
     }
 
-    /**
-     * Calculate token expiration time in seconds.
-     */
     public long getAccessTokenExpirationInSeconds() {
         return securityProperties.getJwt().getAccessTokenExpiration() / 1000;
     }
 
-    /**
-     * Calculate refresh token expiration time in seconds.
-     */
     public long getRefreshTokenExpirationInSeconds() {
         return securityProperties.getJwt().getRefreshTokenExpiration() / 1000;
     }

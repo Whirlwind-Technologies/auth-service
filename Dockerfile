@@ -1,57 +1,60 @@
-FROM maven:3.9.9-eclipse-temurin-21 AS builder
+# Build stage
+FROM maven:3.9-eclipse-temurin-21 AS builder
+
+# Build arguments for GitHub authentication
+ARG GITHUB_ACTOR
+ARG GITHUB_TOKEN
 
 WORKDIR /app
-
-# Copy and install the local nnipa-protos dependency first
-COPY nnipa-protos-1.0.0.jar /tmp/
-RUN mvn install:install-file \
-    -Dfile=/tmp/nnipa-protos-1.0.0.jar \
-    -DgroupId=com.nnipa \
-    -DartifactId=nnipa-protos \
-    -Dversion=1.0.0 \
-    -Dpackaging=jar \
-    -DgeneratePom=true
 
 # Copy pom.xml and download dependencies
 COPY pom.xml .
-RUN mvn dependency:go-offline -B
 
-# Copy source code
+# Create Maven settings.xml with GitHub authentication
+RUN mkdir -p /root/.m2 && \
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"\n          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0\n          http://maven.apache.org/xsd/settings-1.0.0.xsd">\n    <servers>\n        <server>\n            <id>github</id>\n            <username>%s</username>\n            <password>%s</password>\n        </server>\n    </servers>\n</settings>\n' "$GITHUB_ACTOR" "$GITHUB_TOKEN" > /root/.m2/settings.xml
+
+# Download dependencies first (for better layer caching)
+RUN mvn dependency:go-offline -B || true
+
+# Copy source code and build
 COPY src ./src
-
-# Build the application
 RUN mvn clean package -DskipTests
 
-# Runtime stage - use JRE instead of JDK for smaller image
-FROM eclipse-temurin:21-jre-alpine AS runner
+# Runtime stage
+FROM eclipse-temurin:21-jre-alpine
 
-# Install curl for health checks and glibc compatibility for Snappy
-RUN apk add --no-cache curl libc6-compat
+# Install curl for health checks
+RUN apk add --no-cache curl
+
+# Create non-root user
+RUN addgroup -g 1001 -S appuser && \
+    adduser -u 1001 -S appuser -G appuser
+
+# Create directories
+RUN mkdir -p /app/logs && \
+    chown -R appuser:appuser /app
 
 WORKDIR /app
 
-# Copy the JAR file
-COPY --from=builder /app/target/*.jar app.jar
+# Copy JAR from builder
+COPY --from=builder --chown=appuser:appuser /app/target/*.jar app.jar
 
-# Create non-root user for security
-RUN addgroup -g 1001 -S appgroup && \
-    adduser -u 1001 -S appuser -G appgroup && \
-    chown -R appuser:appgroup /app
-
+# Switch to non-root user
 USER appuser
 
-# Expose the correct port
+# JVM options for container environment
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 \
+    -XX:+UseG1GC \
+    -XX:+UseStringDeduplication \
+    -Djava.security.egd=file:/dev/./urandom"
+
+# Expose port
 EXPOSE 4002
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:4002/auth-service/actuator/health || exit 1
 
-# JVM options for container environment
-ENTRYPOINT ["java", \
-    "-XX:+UseContainerSupport", \
-    "-XX:MaxRAMPercentage=75.0", \
-    "-XX:InitialRAMPercentage=50.0", \
-    "-Djava.security.egd=file:/dev/./urandom", \
-    "-jar", \
-    "app.jar"]
+# Run the application
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]

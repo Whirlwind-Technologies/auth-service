@@ -1,5 +1,5 @@
 server:
-  port: 8081
+  port: 4002
 
 spring:
   datasource:
@@ -116,10 +116,20 @@ logging:
 debug: true
 
 # Swagger UI enabled
+# OpenAPI/Swagger Configuration
 springdoc:
+  api-docs:
+    enabled: ${API_DOCS_ENABLED:true}
+    path: /api-docs
   swagger-ui:
-    enabled: true
-    try-it-out-enabled: true
+    enabled: ${SWAGGER_UI_ENABLED:true}
+    path: /swagger-ui.html
+    try-it-out-enabled: false
+    filter: true
+    operations-sorter: method
+    tags-sorter: alpha
+  show-actuator: false
+
 
 # Extended actuator endpoints for development
 management:

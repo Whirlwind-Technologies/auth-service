@@ -66,6 +66,36 @@ public class KafkaConfig {
     }
 
     @Bean
+    public NewTopic userAuthenticatedTopic() {
+        return TopicBuilder.name("nnipa.events.auth.user_authenticated")
+                .partitions(3)
+                .replicas(1)
+                .config("retention.ms", "604800000") // 7 days
+                .config("compression.type", "snappy")
+                .build();
+    }
+
+    @Bean
+    public NewTopic loginRateLimitedTopic() {
+        return TopicBuilder.name("nnipa.events.auth.login_rate_limited")
+                .partitions(3)
+                .replicas(1)
+                .config("retention.ms", "604800000") // 7 days
+                .config("compression.type", "snappy")
+                .build();
+    }
+
+    @Bean
+    public NewTopic securityEventsTopic() {
+        return TopicBuilder.name("nnipa.events.security")
+                .partitions(6)
+                .replicas(1)
+                .config("retention.ms", "2592000000") // 30 days
+                .config("compression.type", "snappy")
+                .build();
+    }
+
+    @Bean
     public NewTopic createTenantCommandTopic() {
         return TopicBuilder.name("nnipa.commands.tenant.create")
                 .partitions(3)

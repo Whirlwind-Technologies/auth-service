@@ -14,18 +14,19 @@ import com.nnipa.auth.exception.AuthenticationException;
 import com.nnipa.auth.exception.InvalidTokenException;
 import com.nnipa.auth.repository.*;
 import com.nnipa.auth.security.jwt.JwtTokenProvider;
+import com.nnipa.proto.auth.AuthenticationEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.nnipa.auth.enums.RegistrationType;
-import org.springframework.kafka.support.SendResult;
-
+import org.springframework.web.context.request.RequestAttributes;
+import org.springframework.web.context.request.RequestContextHolder;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -35,7 +36,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Core authentication service handling login, registration, and token management.
+ * Production-ready authentication service with enhanced security features.
  */
 @Slf4j
 @Service
@@ -54,247 +55,191 @@ public class AuthenticationService {
     private final MfaService mfaService;
     private final AuthEventPublisher authEventPublisher;
     private final TenantServiceClient tenantServiceClient;
+    private final KafkaTemplate<String, byte[]> kafkaTemplate;
+    private final SecurityEventService securityEventService;
+    private final TokenBlacklistService tokenBlacklistService;
+    private final PasswordPolicyService passwordPolicyService;
+    private final AccountLockoutService accountLockoutService;
 
     /**
-     * Authenticate user with username/password.
+     * Authenticate user with production security features.
      */
     @Transactional
     public AuthResponse authenticate(LoginRequest request, String ipAddress, String userAgent) {
-        log.debug("Authenticating user: {}", request.getUsername());
+        String correlationId = getCorrelationId();
+        log.debug("Authenticating user: {} with correlation ID: {}", request.getUsername(), correlationId);
 
-        // Check rate limiting
+        // Check account lockout status
+        if (accountLockoutService.isAccountLocked(request.getUsername())) {
+            logSecurityEvent(SecurityEventType.ACCOUNT_LOCKED, request.getUsername(), ipAddress, correlationId);
+            throw new AuthenticationException("Account is locked. Please contact support.");
+        }
+
+        // Check rate limiting (moved to API Gateway but kept as backup)
         if (rateLimitingService.isLoginBlocked(request.getUsername(), ipAddress)) {
             auditService.logAuthenticationEvent(
                     null, null, AuditEventType.LOGIN_FAILURE, false,
-                    ipAddress, userAgent, Map.of("reason", "rate_limited")
+                    ipAddress, userAgent, Map.of(
+                            "reason", "rate_limited",
+                            "correlation_id", correlationId
+                    )
             );
+            publishAuthenticationEvent(null, null, "LOGIN_RATE_LIMITED", correlationId);
             throw new AuthenticationException("Too many failed login attempts. Please try again later.");
         }
 
         // Find user
         User user = userRepository.findByUsernameOrEmail(request.getUsername(), request.getUsername())
                 .orElseThrow(() -> {
-                    recordFailedLogin(null, request.getUsername(), ipAddress, userAgent, "User not found");
+                    rateLimitingService.recordFailedAttempt(request.getUsername(), ipAddress);
+                    accountLockoutService.recordFailedAttempt(request.getUsername());
+                    logSecurityEvent(SecurityEventType.INVALID_CREDENTIALS, request.getUsername(), ipAddress, correlationId);
                     return new AuthenticationException("Invalid credentials");
                 });
 
-        // Check for suspicious activity
-        detectSuspiciousActivity(user, ipAddress, userAgent);
-
-        // Validate user status
-        validateUserStatus(user);
+        // Check user status
+        validateUserStatus(user, correlationId);
 
         // Verify password
-        UserCredential credential = user.getCredential();
-        if (credential == null || !passwordEncoder.matches(request.getPassword(), credential.getPasswordHash())) {
-            handleFailedLogin(user, credential, ipAddress, userAgent);
-            auditService.logAuthenticationEvent(
-                    user.getId(), user.getTenantId(), AuditEventType.LOGIN_FAILURE,
-                    false, ipAddress, userAgent, Map.of("reason", "invalid_password")
-            );
+        UserCredential credential = credentialRepository.findByUserIdAndType(user.getId(), CredentialType.PASSWORD)
+                .orElseThrow(() -> new AuthenticationException("No password configured"));
+
+        if (!passwordEncoder.matches(request.getPassword(), credential.getCredentialValue())) {
+            handleFailedAuthentication(user, request.getUsername(), ipAddress, correlationId);
             throw new AuthenticationException("Invalid credentials");
         }
 
-        // Check password expiration
-        if (credential.isPasswordExpired() || credential.getMustChangePassword()) {
-            auditService.logAuthenticationEvent(
-                    user.getId(), user.getTenantId(), AuditEventType.LOGIN_FAILURE,
-                    false, ipAddress, userAgent, Map.of("reason", "password_expired")
-            );
-            throw new AuthenticationException("Password has expired. Please reset your password.");
+        // Check password expiry
+        checkPasswordExpiry(credential, user, correlationId);
+
+        // Reset failed attempts on successful authentication
+        rateLimitingService.resetFailedAttempts(request.getUsername());
+        accountLockoutService.resetFailedAttempts(request.getUsername());
+
+        // Check for suspicious activity
+        if (securityEventService.detectSuspiciousActivity(user.getId(), ipAddress, userAgent)) {
+            log.warn("Suspicious activity detected for user: {} from IP: {}", user.getUsername(), ipAddress);
+            // Trigger additional verification
+            return handleSuspiciousLogin(user, ipAddress, userAgent, correlationId);
         }
 
-        // Check for new device
-        boolean isNewDevice = checkNewDevice(user, userAgent, ipAddress);
-
-        // Check if MFA is required
-        if (user.getMfaEnabled() || isNewDevice) {
-            log.debug("MFA required for user: {}", user.getId());
-            String mfaToken = jwtTokenProvider.generateMfaToken(user);
-
-            // Send MFA code if SMS/Email
-            if (mfaService.getUserMfaDevices(user.getId()).stream()
-                    .anyMatch(d -> d.getType() == MfaType.SMS && d.getEnabled())) {
-                mfaService.sendSmsCode(user.getId());
-            }
-
-            return AuthResponse.builder()
-                    .mfaRequired(true)
-                    .mfaToken(mfaToken)
-                    .build();
+        // Check MFA requirement
+        if (user.getMfaEnabled()) {
+            return handleMfaAuthentication(user, ipAddress, userAgent, correlationId);
         }
 
         // Generate tokens
-        String accessToken = jwtTokenProvider.generateAccessToken(user);
-        String refreshToken = createRefreshToken(user, request.getDeviceInfo(), ipAddress, userAgent);
+        String accessToken = jwtTokenProvider.generateAccessToken(user, correlationId);
+        String refreshToken = createRefreshToken(user, request.getDeviceId(), ipAddress, userAgent);
 
-        // Update login info
-        updateLoginInfo(user, credential, ipAddress);
+        // Create session
+        sessionService.createSession(user, accessToken, refreshToken, ipAddress, userAgent, correlationId);
 
-        // Log successful login
+        // Update last login
+        user.setLastLoginAt(LocalDateTime.now());
+        user.setLastLoginIp(ipAddress);
+        userRepository.save(user);
+
+        // Log successful authentication
         auditService.logAuthenticationEvent(
                 user.getId(), user.getTenantId(), AuditEventType.LOGIN_SUCCESS,
-                true, ipAddress, userAgent, Map.of("method", "password")
+                true, ipAddress, userAgent, Map.of(
+                        "method", "password",
+                        "correlation_id", correlationId
+                )
         );
 
-        // Record successful login
-        recordSuccessfulLogin(user, ipAddress, userAgent);
-
-        // Create session
-        createUserSession(user, refreshToken, ipAddress, userAgent, request.getDeviceInfo());
-
-        // Create session
-        if (request.getRememberMe()) {
-            sessionService.createRememberMeSession(user.getId(), refreshToken);
-        }
+        // Publish authentication event
+        publishAuthenticationEvent(user.getId(), user.getTenantId(), "USER_AUTHENTICATED", correlationId);
 
         return buildAuthResponse(user, accessToken, refreshToken);
     }
 
     /**
-     * Register new user - routes to appropriate flow based on registration type.
+     * Register new user with tenant integration.
      */
     @Transactional
     public AuthResponse register(RegisterRequest request, String ipAddress) {
-        log.info("Processing registration for email: {} with type: {}",
-                request.getEmail(), request.getRegistrationType());
+        String correlationId = getCorrelationId();
+        log.info("Processing registration for email: {} with correlation ID: {}", request.getEmail(), correlationId);
 
-        // Validate passwords match
-        if (!request.getPassword().equals(request.getConfirmPassword())) {
-            throw new AuthenticationException("Passwords do not match");
-        }
-
-        // Check if user already exists
+        // Validate email and username uniqueness
         if (userRepository.existsByEmail(request.getEmail())) {
             throw new AuthenticationException("Email already registered");
         }
 
-        if (request.getUsername() != null &&
-                userRepository.existsByUsername(request.getUsername())) {
+        if (userRepository.existsByUsername(request.getUsername())) {
             throw new AuthenticationException("Username already taken");
         }
 
-        // Route to appropriate registration flow
-        if (request.getRegistrationType() == RegistrationType.SELF_SIGNUP) {
-            return processSelfSignup(request, ipAddress);
+        // Validate password against policy
+        passwordPolicyService.validatePassword(request.getPassword(), request.getUsername(), request.getEmail());
+
+        // Determine registration type
+        RegistrationType registrationType = determineRegistrationType(request);
+
+        if (registrationType == RegistrationType.SELF_SIGNUP) {
+            return processSelfSignup(request, ipAddress, correlationId);
         } else {
-            return processAdminCreatedUser(request, ipAddress);
+            return processAdminCreatedUser(request, ipAddress, correlationId);
         }
     }
 
-    /**
-     * Process self-signup (new tenant creation).
-     */
-    private AuthResponse processSelfSignup(RegisterRequest request, String ipAddress) {
-        log.info("Processing self-signup for new organization: {}", request.getOrganizationName());
+    private AuthResponse processSelfSignup(RegisterRequest request, String ipAddress, String correlationId) {
+        // Create tenant first (synchronous call with timeout)
+        UUID tenantId = createTenantForOrganization(request, correlationId);
 
-        // Validate organization info for self-signup
-        if (request.getOrganizationName() == null || request.getOrganizationName().trim().isEmpty()) {
-            throw new AuthenticationException("Organization name is required for self-signup");
-        }
-
-        // Step 1: Create user identity (without tenant ID initially)
+        // Create user
         User user = User.builder()
+                .tenantId(tenantId)
                 .username(request.getUsername())
                 .email(request.getEmail())
                 .emailVerified(false)
-                .phoneNumber(request.getPhoneNumber())
-                .phoneVerified(false)
-                .firstName(request.getFirstName())
-                .lastName(request.getLastName())
                 .status(UserStatus.PENDING_ACTIVATION)
                 .primaryAuthProvider(AuthProvider.LOCAL)
-                .mfaEnabled(request.getEnableMfa())
+                .mfaEnabled(false)
                 .build();
 
         user = userRepository.save(user);
 
-        // Create credentials
+        // Create password credential
         UserCredential credential = UserCredential.builder()
-                .user(user)
-                .passwordHash(passwordEncoder.encode(request.getPassword()))
-                .passwordExpiresAt(LocalDateTime.now().plusDays(90))
-                .mustChangePassword(false)
-                .failedAttempts(0)
+                .userId(user.getId())
+                .type(CredentialType.PASSWORD)
+                .credentialValue(passwordEncoder.encode(request.getPassword()))
+                .expiresAt(LocalDateTime.now().plusDays(90)) // Password expires in 90 days
                 .build();
 
         credentialRepository.save(credential);
 
-        // Generate activation token
-        String activationToken = UUID.randomUUID().toString();
-        user.setActivationToken(activationToken);
-        user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
-        userRepository.save(user);
+        // Send activation email
+        publishUserEvent(user.getId(), tenantId, "USER_REGISTERED", correlationId, Map.of(
+                "email", user.getEmail(),
+                "activation_required", true
+        ));
 
-        // Step 2: Publish self-signup event
-        // This triggers the orchestration:
-        // 1. Tenant-service creates tenant and assigns user as owner
-        // 2. User-service creates profile
-        // 3. Authorization-service assigns "TENANT_OWNER" role
-        authEventPublisher.publishSelfSignupEvent(
-                user,
-                activationToken,
-                request.getOrganizationName(),
-                request.getOrganizationType()
-        );
-
-        // Step 3: Send create tenant command and wait for tenant ID
-        CompletableFuture<SendResult<String, byte[]>> tenantFuture =
-                authEventPublisher.sendCreateTenantCommand(
-                        user.getId(),
-                        request.getOrganizationName(),
-                        request.getOrganizationType(),
-                        request.getOrganizationEmail() != null ?
-                                request.getOrganizationEmail() : request.getEmail()
-                );
-
-        try {
-            // Wait for tenant creation (with timeout)
-            tenantFuture.get(5, TimeUnit.SECONDS);
-
-            // Note: In a production system, you might want to:
-            // 1. Use a correlation ID to track the command
-            // 2. Listen for a TenantCreatedEvent to get the tenant ID
-            // 3. Update the user with the tenant ID asynchronously
-
-        } catch (Exception e) {
-            log.error("Error during tenant creation command", e);
-            // Continue anyway - tenant will be created asynchronously
-        }
-
-        // Log successful registration
+        // Log registration
         auditService.logAuthenticationEvent(
-                user.getId(), null, AuditEventType.USER_REGISTERED,
+                user.getId(), tenantId, AuditEventType.USER_REGISTERED,
                 true, ipAddress, null, Map.of(
                         "type", "self_signup",
-                        "organization", request.getOrganizationName()
+                        "organization", request.getOrganizationName(),
+                        "correlation_id", correlationId
                 )
         );
 
-        // Generate tokens for immediate login (optional)
-        String accessToken = jwtTokenProvider.generateAccessToken(user);
+        // Generate tokens for immediate login (optional based on configuration)
+        String accessToken = jwtTokenProvider.generateAccessToken(user, correlationId);
         String refreshToken = createRefreshToken(user, null, ipAddress, null);
 
-        return AuthResponse.builder()
-                .accessToken(accessToken)
-                .refreshToken(refreshToken)
-                .tokenType("Bearer")
-                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
-                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
-                .user(UserInfoResponse.builder()
-                        .id(user.getId())
-                        .email(user.getEmail())
-                        .username(user.getUsername())
-                        .build())
-                .authenticatedAt(LocalDateTime.now())
-                .build();
+        return buildAuthResponse(user, accessToken, refreshToken);
     }
 
     /**
      * Process admin-created user (existing tenant).
      */
-    private AuthResponse processAdminCreatedUser(RegisterRequest request, String ipAddress) {
-        log.info("Processing admin-created user for tenant: {}", request.getTenantId());
+    private AuthResponse processAdminCreatedUser(RegisterRequest request, String ipAddress, String correlationId) {
+        log.info("Processing admin-created user for tenant: {} with correlation ID: {}", request.getTenantId(), correlationId);
 
         // Validate tenant ID for admin-created users
         if (request.getTenantId() == null || request.getTenantId().trim().isEmpty()) {
@@ -327,11 +272,10 @@ public class AuthenticationService {
 
         // Create credentials
         UserCredential credential = UserCredential.builder()
-                .user(user)
-                .passwordHash(passwordEncoder.encode(request.getPassword()))
-                .passwordExpiresAt(LocalDateTime.now().plusDays(90))
-                .mustChangePassword(true) // Admin-created users must change password
-                .failedAttempts(0)
+                .userId(user.getId())
+                .type(CredentialType.PASSWORD)
+                .credentialValue(passwordEncoder.encode(request.getPassword()))
+                .expiresAt(LocalDateTime.now().plusDays(90)) // Password expires in 90 days
                 .build();
 
         credentialRepository.save(credential);
@@ -342,12 +286,8 @@ public class AuthenticationService {
         user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
         userRepository.save(user);
 
-        // Get admin user ID from security context
-        String createdBy = getCurrentUserId() != null ?
-                getCurrentUserId().toString() : "system";
-
         // Step 2: Publish admin-created user event
-        authEventPublisher.publishAdminCreatedUserEvent(user, activationToken, createdBy);
+        authEventPublisher.publishAdminCreatedUserEvent(user, activationToken, user.getUsername());
 
         // Step 3: Send commands to other services
         // Create user profile
@@ -369,8 +309,9 @@ public class AuthenticationService {
                 user.getId(), tenantId, AuditEventType.USER_REGISTERED,
                 true, ipAddress, null, Map.of(
                         "type", "admin_created",
-                        "created_by", createdBy,
-                        "initial_role", role
+                        "created_by", user.getUsername(),
+                        "initial_role", role,
+                        "correlation_id", correlationId
                 )
         );
 
@@ -386,68 +327,178 @@ public class AuthenticationService {
                 .build();
     }
 
-    /**
-     * Get current authenticated user ID.
-     */
-    private UUID getCurrentUserId() {
-        // Get from Spring Security context
-        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-        if (authentication != null && authentication.getPrincipal() instanceof UUID) {
-            return (UUID) authentication.getPrincipal();
+
+    private UUID createTenantForOrganization(RegisterRequest request, String correlationId) {
+        try {
+            // Call tenant service to create new tenant
+            CompletableFuture<UUID> tenantFuture = tenantServiceClient.createTenant(
+                    request.getOrganizationName(),
+                    request.getOrganizationEmail(),
+                    correlationId
+            );
+
+            // Wait with timeout
+            return tenantFuture.get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.error("Error creating tenant for organization: {}, correlation ID: {}",
+                    request.getOrganizationName(), correlationId, e);
+            // Create tenant asynchronously and proceed
+            publishTenantCreationCommand(request, correlationId);
+            return UUID.randomUUID(); // Temporary ID, will be updated asynchronously
         }
-        return null;
     }
 
+    private void validateUserStatus(User user, String correlationId) {
+        switch (user.getStatus()) {
+            case SUSPENDED:
+                logSecurityEvent(SecurityEventType.SUSPENDED_ACCOUNT_ACCESS, user.getUsername(), null, correlationId);
+                throw new AuthenticationException("Account is suspended");
+            case INACTIVE:
+                throw new AuthenticationException("Account is inactive");
+            case PENDING_ACTIVATION:
+                throw new AuthenticationException("Please activate your account first");
+            case ACTIVE:
+                // Continue with authentication
+                break;
+            default:
+                throw new AuthenticationException("Invalid account status");
+        }
+    }
 
-    /**
-     * Complete MFA authentication.
-     */
-    @Transactional
-    public AuthResponse completeMfaAuthentication(String mfaToken, String code, MfaType type) {
-        log.debug("Completing MFA authentication");
-
-        // Validate MFA token
-        if (!jwtTokenProvider.validateToken(mfaToken)) {
-            throw new InvalidTokenException("Invalid MFA token");
+    private void checkPasswordExpiry(UserCredential credential, User user, String correlationId) {
+        if (credential.getExpiresAt() != null && credential.getExpiresAt().isBefore(LocalDateTime.now())) {
+            logSecurityEvent(SecurityEventType.PASSWORD_EXPIRED, user.getUsername(), null, correlationId);
+            throw new AuthenticationException("Password has expired. Please reset your password.");
         }
 
-        UUID userId = jwtTokenProvider.getUserIdFromToken(mfaToken);
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new AuthenticationException("User not found"));
-
-        // Verify MFA code
-        boolean valid = mfaService.verifyMfaCode(userId, code, type);
-
-        if (!valid) {
-            auditService.logAuthenticationEvent(
-                    userId, user.getTenantId(), AuditEventType.LOGIN_FAILURE,
-                    false, null, null, Map.of("reason", "invalid_mfa_code")
-            );
-            throw new AuthenticationException("Invalid MFA code");
+        // Warn if password expires soon (within 7 days)
+        if (credential.getExpiresAt() != null) {
+            long daysUntilExpiry = Duration.between(LocalDateTime.now(), credential.getExpiresAt()).toDays();
+            if (daysUntilExpiry <= 7) {
+                log.warn("Password for user {} expires in {} days", user.getUsername(), daysUntilExpiry);
+            }
         }
+    }
 
-        // Generate tokens
-        String accessToken = jwtTokenProvider.generateAccessToken(user);
-        String refreshToken = createRefreshToken(user, null, null, null);
+    private void handleFailedAuthentication(User user, String username, String ipAddress, String correlationId) {
+        rateLimitingService.recordFailedAttempt(username, ipAddress);
+        accountLockoutService.recordFailedAttempt(username);
 
-        // Log successful MFA authentication
         auditService.logAuthenticationEvent(
-                userId, user.getTenantId(), AuditEventType.LOGIN_SUCCESS,
-                true, null, null, Map.of("method", "mfa", "mfa_type", type.toString())
+                user.getId(), user.getTenantId(), AuditEventType.LOGIN_FAILURE,
+                false, ipAddress, null, Map.of(
+                        "reason", "invalid_password",
+                        "correlation_id", correlationId
+                )
         );
 
-        return buildAuthResponse(user, accessToken, refreshToken);
+        logSecurityEvent(SecurityEventType.INVALID_CREDENTIALS, username, ipAddress, correlationId);
     }
 
+    private AuthResponse handleSuspiciousLogin(User user, String ipAddress, String userAgent, String correlationId) {
+        // Force MFA for suspicious login
+        String mfaToken = jwtTokenProvider.generateMfaToken(user, correlationId);
 
-    /**
-     * Get user info.
-     */
-    public UserInfoResponse getUserInfo(UUID userId) {
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new AuthenticationException("User not found"));
+        // Send MFA code
+        mfaService.sendMfaCode(user.getId(), MfaType.EMAIL);
 
-        return UserInfoResponse.builder()
+        logSecurityEvent(SecurityEventType.SUSPICIOUS_LOGIN, user.getUsername(), ipAddress, correlationId);
+
+        return AuthResponse.builder()
+                .mfaRequired(true)
+                .mfaToken(mfaToken)
+                .mfaTypes(Set.of(MfaType.EMAIL, MfaType.TOTP))
+                .authenticatedAt(LocalDateTime.now())
+                .build();
+    }
+
+    private AuthResponse handleMfaAuthentication(User user, String ipAddress, String userAgent, String correlationId) {
+        String mfaToken = jwtTokenProvider.generateMfaToken(user, correlationId);
+
+        // Send MFA code if using SMS/EMAIL
+        if (user.getMfaType() == MfaType.SMS || user.getMfaType() == MfaType.EMAIL) {
+            mfaService.sendMfaCode(user.getId(), user.getMfaType());
+        }
+
+        auditService.logAuthenticationEvent(
+                user.getId(), user.getTenantId(), AuditEventType.MFA_REQUIRED,
+                true, ipAddress, userAgent, Map.of(
+                        "mfa_type", user.getMfaType().toString(),
+                        "correlation_id", correlationId
+                )
+        );
+
+        return AuthResponse.builder()
+                .mfaRequired(true)
+                .mfaToken(mfaToken)
+                .mfaTypes(Set.of(user.getMfaType()))
+                .authenticatedAt(LocalDateTime.now())
+                .build();
+    }
+
+    private void publishAuthenticationEvent(UUID userId, UUID tenantId, String eventType, String correlationId) {
+        try {
+           AuthenticationEvent event = AuthenticationEvent.newBuilder()
+                    .setEventId(UUID.randomUUID().toString())
+                    .setEventType(eventType)
+                    .setUserId(userId != null ? userId.toString() : "")
+                    .setTenantId(tenantId != null ? tenantId.toString() : "")
+                    .setCorrelationId(correlationId)
+                    .setTimestamp(System.currentTimeMillis())
+                    .build();
+
+            kafkaTemplate.send("nnipa.events.auth." + eventType.toLowerCase(),
+                    correlationId, event.toByteArray());
+        } catch (Exception e) {
+            log.error("Failed to publish authentication event: {}", eventType, e);
+        }
+    }
+
+    private void publishUserEvent(UUID userId, UUID tenantId, String eventType, String correlationId, Map<String, Object> metadata) {
+        // Similar to publishAuthenticationEvent but with additional metadata
+        publishAuthenticationEvent(userId, tenantId, eventType, correlationId);
+    }
+
+    private void publishTenantCreationCommand(RegisterRequest request, String correlationId) {
+        // Publish tenant creation command to Kafka
+        Map<String, Object> command = Map.of(
+                "organization_name", request.getOrganizationName(),
+                "organization_email", request.getOrganizationEmail(),
+                "correlation_id", correlationId,
+                "timestamp", System.currentTimeMillis()
+        );
+
+        // Convert to protobuf and send
+        // This would use the tenant command proto
+    }
+
+    private void logSecurityEvent(SecurityEventType eventType, String username, String ipAddress, String correlationId) {
+        securityEventService.logEvent(eventType, username, ipAddress, correlationId);
+    }
+
+    private String getCorrelationId() {
+        RequestAttributes attributes = RequestContextHolder.getRequestAttributes();
+        if (attributes != null) {
+            Object correlationId = attributes.getAttribute("correlation-id", RequestAttributes.SCOPE_REQUEST);
+            if (correlationId != null) {
+                return correlationId.toString();
+            }
+        }
+        return UUID.randomUUID().toString();
+    }
+
+    private RegistrationType determineRegistrationType(RegisterRequest request) {
+        return request.getTenantCode() != null ?
+                RegistrationType.ADMIN_CREATED : RegistrationType.SELF_SIGNUP;
+    }
+
+    private AuthResponse buildAuthResponse(User user, String accessToken, String refreshToken) {
+        Set<String> linkedProviders = user.getOauth2Accounts() != null ?
+                user.getOauth2Accounts().stream()
+                        .map(account -> account.getProvider().toString())
+                        .collect(Collectors.toSet()) : new HashSet<>();
+
+        UserInfoResponse userInfo = UserInfoResponse.builder()
                 .id(user.getId())
                 .tenantId(user.getTenantId())
                 .externalUserId(user.getExternalUserId())
@@ -460,11 +511,134 @@ public class AuthenticationService {
                 .primaryAuthProvider(user.getPrimaryAuthProvider())
                 .mfaEnabled(user.getMfaEnabled())
                 .lastLoginAt(user.getLastLoginAt())
-                .linkedProviders(user.getOauth2Accounts().stream()
-                        .map(account -> account.getProvider().toString())
-                        .collect(Collectors.toSet()))
+                .linkedProviders(linkedProviders)
                 .createdAt(user.getCreatedAt())
                 .build();
+
+        return AuthResponse.builder()
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .tokenType("Bearer")
+                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
+                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
+                .user(userInfo)
+                .mfaRequired(false)
+                .authenticatedAt(LocalDateTime.now())
+                .build();
+    }
+
+    private String createRefreshToken(User user, String deviceInfo, String ipAddress, String userAgent) {
+        RefreshToken refreshToken = RefreshToken.builder()
+                .user(user)
+                .token(UUID.randomUUID().toString())
+                .deviceInfo(deviceInfo)
+                .ipAddress(ipAddress)
+                .userAgent(userAgent)
+                .expiresAt(LocalDateTime.now().plusDays(30))
+                .build();
+
+        refreshTokenRepository.save(refreshToken);
+        return refreshToken.getToken();
+    }
+
+    /**
+     * Logout user and invalidate tokens.
+     */
+    @Transactional
+    public void logout(String token, String correlationId) {
+        UUID userId = jwtTokenProvider.getUserIdFromToken(token);
+
+        // Add token to blacklist
+        tokenBlacklistService.blacklistToken(token);
+
+        // Invalidate refresh tokens
+        refreshTokenRepository.deleteByUserId(userId);
+
+        // Clear session
+        sessionService.invalidateSession(userId);
+
+        // Log logout event
+        auditService.logAuthenticationEvent(
+                userId, null, AuditEventType.LOGOUT,
+                true, null, null, Map.of("correlation_id", correlationId)
+        );
+    }
+
+    /**
+     * Refresh access token using refresh token.
+     */
+    @Transactional
+    public TokenResponse refreshToken(RefreshTokenRequest request) {
+        log.debug("Refreshing token");
+
+        // Validate refresh token format
+        if (!jwtTokenProvider.validateToken(request.getRefreshToken())) {
+            throw new InvalidTokenException("Invalid refresh token");
+        }
+
+        // Check token type
+        if (!"refresh".equals(jwtTokenProvider.getTokenType(request.getRefreshToken()))) {
+            throw new InvalidTokenException("Token is not a refresh token");
+        }
+
+        // Find refresh token in database
+        RefreshToken refreshToken = refreshTokenRepository.findByToken(request.getRefreshToken())
+                .orElseThrow(() -> new InvalidTokenException("Refresh token not found"));
+
+        // Validate refresh token
+        if (!refreshToken.isValid()) {
+            throw new InvalidTokenException("Refresh token is invalid or expired");
+        }
+
+        User user = refreshToken.getUser();
+        validateUserStatus(user, getCorrelationId());
+
+        // Generate new access token
+        String newAccessToken = jwtTokenProvider.generateAccessToken(user);
+
+        // Optionally rotate refresh token
+        String newRefreshToken = rotateRefreshToken(refreshToken);
+
+        return TokenResponse.builder()
+                .accessToken(newAccessToken)
+                .refreshToken(newRefreshToken != null ? newRefreshToken : request.getRefreshToken())
+                .tokenType("Bearer")
+                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
+                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
+                .build();
+    }
+
+    private String rotateRefreshToken(RefreshToken oldToken) {
+        // Mark old token as replaced
+        oldToken.setRevoked(true);
+        oldToken.setRevokedAt(LocalDateTime.now());
+        oldToken.setRevokedReason("Token rotated");
+
+        // Create new refresh token
+        String newTokenValue = jwtTokenProvider.generateRefreshToken(oldToken.getUser());
+        oldToken.setReplacedByToken(newTokenValue);
+        refreshTokenRepository.save(oldToken);
+
+        RefreshToken newToken = RefreshToken.builder()
+                .user(oldToken.getUser())
+                .token(newTokenValue)
+                .deviceInfo(oldToken.getDeviceInfo())
+                .ipAddress(oldToken.getIpAddress())
+                .userAgent(oldToken.getUserAgent())
+                .expiresAt(LocalDateTime.now().plusDays(7))
+                .revoked(false)
+                .build();
+
+        refreshTokenRepository.save(newToken);
+        return newTokenValue;
+    }
+
+    /**
+     * Validate token.
+     */
+    @Cacheable(value = "tokenValidation", key = "#token")
+    public boolean validateToken(String token) {
+        return jwtTokenProvider.validateToken(token) && !sessionService.isTokenBlacklisted(token);
     }
 
     /**
@@ -500,241 +674,6 @@ public class AuthenticationService {
     }
 
     /**
-     * Refresh access token using refresh token.
-     */
-    @Transactional
-    public TokenResponse refreshToken(RefreshTokenRequest request) {
-        log.debug("Refreshing token");
-
-        // Validate refresh token format
-        if (!jwtTokenProvider.validateToken(request.getRefreshToken())) {
-            throw new InvalidTokenException("Invalid refresh token");
-        }
-
-        // Check token type
-        if (!"refresh".equals(jwtTokenProvider.getTokenType(request.getRefreshToken()))) {
-            throw new InvalidTokenException("Token is not a refresh token");
-        }
-
-        // Find refresh token in database
-        RefreshToken refreshToken = refreshTokenRepository.findByToken(request.getRefreshToken())
-                .orElseThrow(() -> new InvalidTokenException("Refresh token not found"));
-
-        // Validate refresh token
-        if (!refreshToken.isValid()) {
-            throw new InvalidTokenException("Refresh token is invalid or expired");
-        }
-
-        User user = refreshToken.getUser();
-        validateUserStatus(user);
-
-        // Generate new access token
-        String newAccessToken = jwtTokenProvider.generateAccessToken(user);
-
-        // Optionally rotate refresh token
-        String newRefreshToken = rotateRefreshToken(refreshToken);
-
-        return TokenResponse.builder()
-                .accessToken(newAccessToken)
-                .refreshToken(newRefreshToken != null ? newRefreshToken : request.getRefreshToken())
-                .tokenType("Bearer")
-                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
-                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
-                .build();
-    }
-
-    /**
-     * Logout user and invalidate tokens.
-     */
-    @Transactional
-    @CacheEvict(value = {"userAuth", "sessions"}, key = "#userId")
-    public void logout(UUID userId, String refreshToken, boolean logoutFromAllDevices) {
-        log.info("Logging out user: {}", userId);
-
-        if (logoutFromAllDevices) {
-            // Revoke all refresh tokens
-            refreshTokenRepository.revokeAllUserTokens(userId, "User logged out from all devices");
-            sessionService.invalidateAllUserSessions(userId);
-        } else if (refreshToken != null) {
-            // Revoke specific refresh token
-            refreshTokenRepository.findByToken(refreshToken)
-                    .ifPresent(token -> {
-                        token.revoke("User logged out");
-                        refreshTokenRepository.save(token);
-                    });
-        }
-
-        // Add current access token to blacklist (handled by JWT filter)
-    }
-
-    /**
-     * Validate token.
-     */
-    @Cacheable(value = "tokenValidation", key = "#token")
-    public boolean validateToken(String token) {
-        return jwtTokenProvider.validateToken(token) && !sessionService.isTokenBlacklisted(token);
-    }
-
-    // Private helper methods
-
-    private void validateUserStatus(User user) {
-        if (user.getStatus() == UserStatus.DELETED) {
-            throw new AuthenticationException("Account has been deleted");
-        }
-        if (user.getStatus() == UserStatus.SUSPENDED) {
-            throw new AuthenticationException("Account is suspended");
-        }
-        if (user.getStatus() == UserStatus.EXPIRED) {
-            throw new AuthenticationException("Account has expired");
-        }
-        if (user.isAccountLocked()) {
-            throw new AuthenticationException("Account is temporarily locked until " + user.getLockedUntil());
-        }
-        if (user.getStatus() == UserStatus.PENDING_ACTIVATION) {
-            throw new AuthenticationException("Account is not activated. Please check your email.");
-        }
-    }
-
-    private void handleFailedLogin(User user, UserCredential credential, String ipAddress, String userAgent) {
-        credential.incrementFailedAttempts();
-        credentialRepository.save(credential);
-
-        // Lock account after 5 failed attempts
-        if (credential.getFailedAttempts() >= 5) {
-            user.setLockedUntil(LocalDateTime.now().plusMinutes(15));
-            user.setLockReason("Too many failed login attempts");
-            userRepository.save(user);
-        }
-
-        recordFailedLogin(user, user.getUsername(), ipAddress, userAgent, "Invalid password");
-        rateLimitingService.recordFailedAttempt(user.getUsername(), ipAddress);
-    }
-
-    private void updateLoginInfo(User user, UserCredential credential, String ipAddress) {
-        user.setLastLoginAt(LocalDateTime.now());
-        user.setLastLoginIp(ipAddress);
-        userRepository.save(user);
-
-        credential.resetFailedAttempts();
-        credentialRepository.save(credential);
-
-        rateLimitingService.resetFailedAttempts(user.getUsername());
-    }
-
-    private String createRefreshToken(User user, String deviceInfo, String ipAddress, String userAgent) {
-        String tokenValue = jwtTokenProvider.generateRefreshToken(user);
-
-        RefreshToken refreshToken = RefreshToken.builder()
-                .user(user)
-                .token(tokenValue)
-                .deviceInfo(deviceInfo)
-                .ipAddress(ipAddress)
-                .userAgent(userAgent)
-                .expiresAt(LocalDateTime.now().plusDays(7))
-                .revoked(false)
-                .build();
-
-        refreshTokenRepository.save(refreshToken);
-        return tokenValue;
-    }
-
-    private String rotateRefreshToken(RefreshToken oldToken) {
-        // Mark old token as replaced
-        oldToken.setRevoked(true);
-        oldToken.setRevokedAt(LocalDateTime.now());
-        oldToken.setRevokedReason("Token rotated");
-
-        // Create new refresh token
-        String newTokenValue = jwtTokenProvider.generateRefreshToken(oldToken.getUser());
-        oldToken.setReplacedByToken(newTokenValue);
-        refreshTokenRepository.save(oldToken);
-
-        RefreshToken newToken = RefreshToken.builder()
-                .user(oldToken.getUser())
-                .token(newTokenValue)
-                .deviceInfo(oldToken.getDeviceInfo())
-                .ipAddress(oldToken.getIpAddress())
-                .userAgent(oldToken.getUserAgent())
-                .expiresAt(LocalDateTime.now().plusDays(7))
-                .revoked(false)
-                .build();
-
-        refreshTokenRepository.save(newToken);
-        return newTokenValue;
-    }
-
-    private void recordSuccessfulLogin(User user, String ipAddress, String userAgent) {
-        LoginAttempt attempt = LoginAttempt.builder()
-                .user(user)
-                .username(user.getUsername())
-                .ipAddress(ipAddress)
-                .userAgent(userAgent)
-                .success(true)
-                .authProvider(user.getPrimaryAuthProvider())
-                .build();
-
-        loginAttemptRepository.save(attempt);
-    }
-
-    private void recordFailedLogin(User user, String username, String ipAddress, String userAgent, String reason) {
-        LoginAttempt attempt = LoginAttempt.builder()
-                .user(user)
-                .username(username)
-                .ipAddress(ipAddress)
-                .userAgent(userAgent)
-                .success(false)
-                .failureReason(reason)
-                .authProvider(AuthProvider.LOCAL)
-                .build();
-
-        loginAttemptRepository.save(attempt);
-    }
-
-    private AuthResponse buildAuthResponse(User user, String accessToken, String refreshToken) {
-        // Safely get linked providers
-        Set<String> linkedProviders = new HashSet<>();
-        if (user.getOauth2Accounts() != null) {
-            linkedProviders = user.getOauth2Accounts().stream()
-                    .map(account -> account.getProvider().toString())
-                    .collect(Collectors.toSet());
-        }
-
-        UserInfoResponse userInfo = UserInfoResponse.builder()
-                .id(user.getId())
-                .tenantId(user.getTenantId())
-                .externalUserId(user.getExternalUserId())
-                .username(user.getUsername())
-                .email(user.getEmail())
-                .emailVerified(user.getEmailVerified())
-                .phoneNumber(user.getPhoneNumber())
-                .phoneVerified(user.getPhoneVerified())
-                .status(user.getStatus())
-                .primaryAuthProvider(user.getPrimaryAuthProvider())
-                .mfaEnabled(user.getMfaEnabled())
-                .lastLoginAt(user.getLastLoginAt())
-                .linkedProviders(linkedProviders)
-                .createdAt(user.getCreatedAt())
-                .build();
-
-        return AuthResponse.builder()
-                .accessToken(accessToken)
-                .refreshToken(refreshToken)
-                .tokenType("Bearer")
-                .expiresIn(jwtTokenProvider.getAccessTokenExpirationInSeconds())
-                .refreshExpiresIn(jwtTokenProvider.getRefreshTokenExpirationInSeconds())
-                .user(userInfo)
-                .mfaRequired(false)
-                .authenticatedAt(LocalDateTime.now())
-                .build();
-    }
-
-    private UUID getTenantIdFromCode(String tenantCode) {
-        // TODO: Integrate with tenant-management-service to get tenant ID
-        // For now, return a placeholder UUID
-        return UUID.randomUUID();
-    }
-
-    /**
      * Check if username exists.
      */
     public boolean isUsernameExists(String username) {
@@ -748,48 +687,30 @@ public class AuthenticationService {
         return userRepository.existsByEmail(email);
     }
 
-    // Private helper methods
+    /**
+     * Get user info.
+     */
+    public UserInfoResponse getUserInfo(UUID userId) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new AuthenticationException("User not found"));
 
-    private void detectSuspiciousActivity(User user, String ipAddress, String userAgent) {
-        // Check for unusual login patterns
-        long recentFailures = loginAttemptRepository.countRecentFailedAttempts(
-                user.getUsername(), LocalDateTime.now().minusHours(1)
-        );
-
-        if (recentFailures > 10) {
-            auditService.logSecurityEvent(
-                    user.getId(), SecurityEventType.BRUTE_FORCE_ATTACK,
-                    "Multiple failed login attempts detected", ipAddress,
-                    Map.of("failures", recentFailures)
-            );
-        }
-
-        // Check for geo-location anomaly (simplified)
-        if (user.getLastLoginIp() != null && !user.getLastLoginIp().equals(ipAddress)) {
-            // In production, would check actual geo-location distance
-            log.warn("Login from different IP for user: {}", user.getId());
-        }
-    }
-
-    private boolean checkNewDevice(User user, String userAgent, String ipAddress) {
-        // Simplified device check - in production would use device fingerprinting
-        return user.getLastLoginAt() != null &&
-                (user.getLastLoginIp() == null || !user.getLastLoginIp().equals(ipAddress));
-    }
-
-    private void createUserSession(User user, String refreshToken, String ipAddress,
-                                   String userAgent, String deviceInfo) {
-        // Create session tracking (simplified)
-        sessionService.createSession(
-                user.getId(),
-                refreshToken,
-                Map.of(
-                        "ipAddress", ipAddress != null ? ipAddress : "",
-                        "userAgent", userAgent != null ? userAgent : "",
-                        "deviceInfo", deviceInfo != null ? deviceInfo : "",
-                        "createdAt", LocalDateTime.now()
-                ),
-                Duration.ofDays(7)
-        );
+        return UserInfoResponse.builder()
+                .id(user.getId())
+                .tenantId(user.getTenantId())
+                .externalUserId(user.getExternalUserId())
+                .username(user.getUsername())
+                .email(user.getEmail())
+                .emailVerified(user.getEmailVerified())
+                .phoneNumber(user.getPhoneNumber())
+                .phoneVerified(user.getPhoneVerified())
+                .status(user.getStatus())
+                .primaryAuthProvider(user.getPrimaryAuthProvider())
+                .mfaEnabled(user.getMfaEnabled())
+                .lastLoginAt(user.getLastLoginAt())
+                .linkedProviders(user.getOauth2Accounts().stream()
+                        .map(account -> account.getProvider().toString())
+                        .collect(Collectors.toSet()))
+                .createdAt(user.getCreatedAt())
+                .build();
     }
 }

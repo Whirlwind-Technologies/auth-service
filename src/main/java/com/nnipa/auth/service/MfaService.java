@@ -305,6 +305,28 @@ public class MfaService {
     }
 
     /**
+     * Send MFA code - main method called by AuthenticationService.
+     */
+    public void sendMfaCode(UUID userId, MfaType mfaType) {
+        log.debug("Sending {} MFA code to user: {}", mfaType, userId);
+
+        switch (mfaType) {
+            case SMS:
+                sendSmsCode(userId);
+                break;
+            case EMAIL:
+                sendEmailCode(userId);
+                break;
+            case TOTP:
+                // TOTP doesn't require sending a code - user generates it on their device
+                log.debug("TOTP MFA requested - no code to send");
+                break;
+            default:
+                throw new AuthenticationException("Unsupported MFA type for code sending: " + mfaType);
+        }
+    }
+
+    /**
      * Send MFA code via SMS.
      */
     public void sendSmsCode(UUID userId) {
@@ -319,6 +341,30 @@ public class MfaService {
 
         // Store code in Redis
         String codeKey = MFA_CODE_PREFIX + "sms:" + userId;
+        redisTemplate.opsForValue().set(codeKey, code, MFA_CODE_TTL);
+    }
+
+    /**
+     * Send MFA code via email.
+     */
+    public void sendEmailCode(UUID userId) {
+        log.debug("Sending email MFA code to user: {}", userId);
+
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new AuthenticationException("User not found"));
+
+        // Check if user has email verified
+        if (!user.getEmailVerified()) {
+            throw new AuthenticationException("Email not verified for MFA");
+        }
+
+        String code = generateVerificationCode();
+
+        // Send email code (implement your email service here)
+        sendEmailCode(user.getEmail(), code);
+
+        // Store code in Redis
+        String codeKey = MFA_CODE_PREFIX + "email:" + userId;
         redisTemplate.opsForValue().set(codeKey, code, MFA_CODE_TTL);
     }
 
@@ -366,6 +412,31 @@ public class MfaService {
     }
 
     // Private helper methods
+
+    /**
+     * Send email code to specified email address.
+     */
+    private void sendEmailCode(String email, String code) {
+        try {
+            // TODO: Implement email sending logic using your email service
+            // Example: emailService.sendMfaCode(email, code);
+
+            String messageBody = String.format(
+                    "%s: Your verification code is %s. It will expire in 5 minutes.",
+                    securityProperties.getMfa().getIssuer(),
+                    code
+            );
+
+            log.debug("Email MFA code would be sent to: {} (implement email service)", maskEmail(email));
+
+            // For now, just log the code for development/testing
+            log.info("MFA Email Code for {}: {} (remove this log in production)", maskEmail(email), code);
+
+        } catch (Exception e) {
+            log.error("Failed to send email MFA code: {}", e.getMessage());
+            throw new AuthenticationException("Failed to send email verification code");
+        }
+    }
 
     private void sendSmsCode(String phoneNumber, String code) {
         try {
@@ -416,6 +487,40 @@ public class MfaService {
             return "****";
         }
         return phoneNumber.substring(0, 3) + "****" + phoneNumber.substring(phoneNumber.length() - 2);
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) {
+            return "****@****.***";
+        }
+
+        String[] parts = email.split("@");
+        String username = parts[0];
+        String domain = parts[1];
+
+        String maskedUsername;
+        if (username.length() <= 2) {
+            maskedUsername = "**";
+        } else {
+            maskedUsername = username.substring(0, 1) + "****" + username.substring(username.length() - 1);
+        }
+
+        String maskedDomain;
+        if (domain.contains(".")) {
+            String[] domainParts = domain.split("\\.");
+            String domainName = domainParts[0];
+            String extension = domainParts[domainParts.length - 1];
+
+            if (domainName.length() <= 2) {
+                maskedDomain = "**." + extension;
+            } else {
+                maskedDomain = domainName.substring(0, 1) + "**." + extension;
+            }
+        } else {
+            maskedDomain = "**";
+        }
+
+        return maskedUsername + "@" + maskedDomain;
     }
 
     private void recordFailedMfaAttempt(UUID userId) {

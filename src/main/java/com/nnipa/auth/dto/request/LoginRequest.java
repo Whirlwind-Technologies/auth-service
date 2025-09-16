@@ -31,6 +31,9 @@ public class LoginRequest {
     @Schema(description = "Remember me flag for extended session", example = "true")
     private Boolean rememberMe = false;
 
+    @Schema(description = "Device Id")
+    private String deviceId;
+
     @Schema(description = "Device information for session tracking", example = "Chrome on Windows")
     private String deviceInfo;
 }

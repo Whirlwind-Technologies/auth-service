@@ -1,5 +1,6 @@
 package com.nnipa.auth.entity;
 
+import com.nnipa.auth.enums.CredentialType;
 import jakarta.persistence.*;
 import lombok.*;
 
@@ -9,11 +10,12 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * User credentials for local authentication.
- * Stores password hashes and password history.
+ * User credentials entity - fixed version
  */
 @Entity
-@Table(name = "user_credentials")
+@Table(name = "user_credentials", indexes = {
+        @Index(name = "idx_credential_user_type", columnList = "user_id, type", unique = true)
+})
 @Getter
 @Setter
 @Builder
@@ -21,18 +23,21 @@ import java.util.UUID;
 @AllArgsConstructor
 public class UserCredential extends BaseEntity {
 
-    @OneToOne
-    @JoinColumn(name = "user_id", nullable = false, unique = true)
-    private User user;
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
 
-    @Column(name = "password_hash", nullable = false)
-    private String passwordHash;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "type", nullable = false, length = 30)
+    private CredentialType type;
+
+    @Column(name = "credential_value", nullable = false)
+    private String credentialValue; // This was missing - contains the actual password hash
 
     @Column(name = "salt")
-    private String salt; // Optional, BCrypt includes salt in hash
+    private String salt;
 
-    @Column(name = "password_expires_at")
-    private LocalDateTime passwordExpiresAt;
+    @Column(name = "expires_at")
+    private LocalDateTime expiresAt;
 
     @Column(name = "must_change_password")
     private Boolean mustChangePassword = false;
@@ -43,8 +48,14 @@ public class UserCredential extends BaseEntity {
     @Column(name = "last_failed_attempt")
     private LocalDateTime lastFailedAttempt;
 
+    // Relationships
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", insertable = false, updatable = false)
+    private User user;
+
     @OneToMany(mappedBy = "credential", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     @OrderBy("createdAt DESC")
+    @Builder.Default
     private Set<PasswordHistory> passwordHistory = new HashSet<>();
 
     // Helper methods
@@ -58,7 +69,7 @@ public class UserCredential extends BaseEntity {
         this.lastFailedAttempt = null;
     }
 
-    public boolean isPasswordExpired() {
-        return passwordExpiresAt != null && passwordExpiresAt.isBefore(LocalDateTime.now());
+    public boolean isExpired() {
+        return expiresAt != null && expiresAt.isBefore(LocalDateTime.now());
     }
 }

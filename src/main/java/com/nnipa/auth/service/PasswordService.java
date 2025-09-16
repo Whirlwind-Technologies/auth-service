@@ -139,7 +139,7 @@ public class PasswordService {
                 .orElseThrow(() -> new AuthenticationException("Credentials not found"));
 
         // Verify current password
-        if (!passwordEncoder.matches(currentPassword, credential.getPasswordHash())) {
+        if (!passwordEncoder.matches(currentPassword, credential.getCredentialValue())) {
             throw new AuthenticationException("Current password is incorrect");
         }
 
@@ -165,8 +165,8 @@ public class PasswordService {
         savePasswordToHistory(credential);
 
         // Update password
-        credential.setPasswordHash(passwordEncoder.encode(newPassword));
-        credential.setPasswordExpiresAt(LocalDateTime.now().plusDays(
+        credential.setCredentialValue(passwordEncoder.encode(newPassword));
+        credential.setExpiresAt(LocalDateTime.now().plusDays(
                 securityProperties.getPassword().getPolicy().getMaxAgeDays()
         ));
         credential.setMustChangePassword(false);
@@ -260,13 +260,13 @@ public class PasswordService {
                         .build());
 
         // Save old password to history if exists
-        if (credential.getPasswordHash() != null) {
+        if (credential.getCredentialValue() != null) {
             savePasswordToHistory(credential);
         }
 
         // Update password
-        credential.setPasswordHash(passwordEncoder.encode(newPassword));
-        credential.setPasswordExpiresAt(LocalDateTime.now().plusDays(
+        credential.setCredentialValue(passwordEncoder.encode(newPassword));
+        credential.setExpiresAt(LocalDateTime.now().plusDays(
                 securityProperties.getPassword().getPolicy().getMaxAgeDays()
         ));
         credential.setMustChangePassword(false);
@@ -302,7 +302,7 @@ public class PasswordService {
                 .orElseThrow(() -> new AuthenticationException("User credentials not found"));
 
         credential.setMustChangePassword(true);
-        credential.setPasswordExpiresAt(LocalDateTime.now());
+        credential.setExpiresAt(LocalDateTime.now());
         credentialRepository.save(credential);
     }
 
@@ -317,7 +317,7 @@ public class PasswordService {
             return false;
         }
 
-        return credential.isPasswordExpired() || credential.getMustChangePassword();
+        return credential.isExpired() || credential.getMustChangePassword();
     }
 
     /**
@@ -348,7 +348,7 @@ public class PasswordService {
         }
 
         // Check current password
-        if (passwordEncoder.matches(newPassword, credential.getPasswordHash())) {
+        if (passwordEncoder.matches(newPassword, credential.getCredentialValue())) {
             return false;
         }
 
@@ -369,7 +369,7 @@ public class PasswordService {
     private void savePasswordToHistory(UserCredential credential) {
         PasswordHistory history = PasswordHistory.builder()
                 .credential(credential)
-                .passwordHash(credential.getPasswordHash())
+                .passwordHash(credential.getCredentialValue())
                 .salt(credential.getSalt())
                 .build();
 

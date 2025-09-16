@@ -1,6 +1,7 @@
 package com.nnipa.auth.dto.response;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.nnipa.auth.enums.MfaType;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -8,6 +9,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
+import java.util.Set;
 
 /**
  * Authentication response DTO.
@@ -43,6 +45,9 @@ public class AuthResponse {
 
     @Schema(description = "MFA token for verification (when MFA is required)")
     private String mfaToken;
+
+    @Schema(description = "Supported MFA Types")
+    private Set<MfaType> mfaTypes;
 
     @Schema(description = "Authentication timestamp")
     private LocalDateTime authenticatedAt;

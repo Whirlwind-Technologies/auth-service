@@ -20,4 +20,5 @@ public enum AuditEventType {
     ACCOUNT_ACTIVATED,
     ACCOUNT_DEACTIVATED,
     USER_REGISTERED,
+    MFA_REQUIRED
 }

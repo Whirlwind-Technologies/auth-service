@@ -140,21 +140,17 @@ public class AuthController {
     })
     @PreAuthorize("isAuthenticated()")
     public ResponseEntity<ApiResponse<Void>> logout(
-            @RequestBody(required = false) LogoutRequest request,
-            @RequestHeader("Authorization") String authHeader,
-            @AuthenticationPrincipal UUID userId) {
-
-        log.info("Logout request for user: {}", userId);
+            @RequestHeader("Authorization") String authHeader) {
 
         // Extract token from header
         String token = authHeader.replace("Bearer ", "");
-        String jti = jwtTokenProvider.getJtiFromToken(token);
 
-        authenticationService.logout(
-                userId,
-                request != null ? request.getRefreshToken() : null,
-                request != null && request.getLogoutFromAllDevices()
-        );
+        // Generate correlation ID for tracking
+        String correlationId = UUID.randomUUID().toString();
+
+        log.info("Logout request with correlation ID: {}", correlationId);
+
+        authenticationService.logout(token, correlationId);
 
         return ResponseEntity.ok(ApiResponse.success(null, "Logged out successfully"));
     }
@@ -296,4 +292,5 @@ public class AuthController {
 
         return request.getRemoteAddr();
     }
+
 }

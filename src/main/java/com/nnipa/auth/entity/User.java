@@ -1,6 +1,7 @@
 package com.nnipa.auth.entity;
 
 import com.nnipa.auth.enums.AuthProvider;
+import com.nnipa.auth.enums.MfaType;
 import com.nnipa.auth.enums.UserStatus;
 import jakarta.persistence.*;
 import lombok.*;
@@ -13,9 +14,7 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * User entity representing authenticated users in the system.
- * This entity is managed by auth-service only for authentication purposes.
- * User profiles and detailed information are managed by user-management-service.
+ * User entity - fixed version with MFA type support
  */
 @Entity
 @Table(name = "users", indexes = {
@@ -38,15 +37,15 @@ public class User extends BaseEntity {
     private UUID tenantId;
 
     @Column(name = "external_user_id")
-    private UUID externalUserId; // Reference to user-management-service user
+    private UUID externalUserId;
 
     @Column(name = "username", unique = true, length = 100)
     private String username;
 
-    @Column(name = "first_name", unique = true, length = 100)
+    @Column(name = "first_name", length = 100)
     private String firstName;
 
-    @Column(name = "last_name", unique = true, length = 100)
+    @Column(name = "last_name", length = 100)
     private String lastName;
 
     @Column(name = "email", nullable = false, unique = true, length = 255)
@@ -71,6 +70,10 @@ public class User extends BaseEntity {
 
     @Column(name = "mfa_enabled")
     private Boolean mfaEnabled = false;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "mfa_type", length = 30)
+    private MfaType mfaType; // Added this field
 
     @Column(name = "mfa_secret")
     private String mfaSecret;
@@ -100,8 +103,9 @@ public class User extends BaseEntity {
     private LocalDateTime deletedAt;
 
     // Relationships
-    @OneToOne(mappedBy = "user", cascade = CascadeType.ALL)
-    private UserCredential credential;
+    @OneToMany(mappedBy = "user", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
+    @Builder.Default
+    private Set<UserCredential> credentials = new HashSet<>();
 
     @OneToMany(mappedBy = "user", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     @Builder.Default
@@ -130,7 +134,21 @@ public class User extends BaseEntity {
 
     public boolean requiresPasswordChange() {
         if (passwordChangedAt == null) return true;
-        // Password expires after 90 days (configurable)
         return passwordChangedAt.plusDays(90).isBefore(LocalDateTime.now());
+    }
+
+    // Fixed method to get MFA type from primary enabled device
+    public MfaType getMfaType() {
+        if (this.mfaType != null) {
+            return this.mfaType;
+        }
+
+        // Fallback: get from enabled MFA devices
+        return mfaDevices.stream()
+                .filter(MfaDevice::getEnabled)
+                .filter(device -> device.getIsPrimary() != null && device.getIsPrimary())
+                .map(MfaDevice::getType)
+                .findFirst()
+                .orElse(MfaType.TOTP); // Default fallback
     }
 }

@@ -1,17 +1,18 @@
 package com.nnipa.auth.service;
 
+import com.nnipa.auth.entity.User;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.Set;
-import java.util.UUID;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Service for managing user sessions with Redis.
+ * Session service - fixed version with proper method signatures
  */
 @Slf4j
 @Service
@@ -25,7 +26,41 @@ public class SessionService {
     private static final String USER_SESSIONS_PREFIX = "user-sessions:";
 
     /**
-     * Create a new session.
+     * Create session - method signature to match AuthenticationService call
+     */
+    public void createSession(User user, String accessToken, String refreshToken,
+                              String ipAddress, String userAgent, String correlationId) {
+
+        String sessionId = UUID.randomUUID().toString();
+
+        Map<String, Object> sessionData = new HashMap<>();
+        sessionData.put("userId", user.getId().toString());
+        sessionData.put("tenantId", user.getTenantId().toString());
+        sessionData.put("username", user.getUsername());
+        sessionData.put("email", user.getEmail());
+        sessionData.put("accessToken", accessToken);
+        sessionData.put("refreshToken", refreshToken);
+        sessionData.put("ipAddress", ipAddress);
+        sessionData.put("userAgent", userAgent);
+        sessionData.put("correlationId", correlationId);
+        sessionData.put("createdAt", LocalDateTime.now().toString());
+        sessionData.put("lastAccessedAt", LocalDateTime.now().toString());
+
+        Duration ttl = Duration.ofHours(24); // Default session TTL
+
+        String sessionKey = SESSION_PREFIX + sessionId;
+        String userSessionKey = USER_SESSIONS_PREFIX + user.getId();
+
+        redisTemplate.opsForValue().set(sessionKey, sessionData, ttl);
+        redisTemplate.opsForSet().add(userSessionKey, sessionId);
+        redisTemplate.expire(userSessionKey, ttl);
+
+        log.debug("Created session {} for user {} with correlation ID: {}",
+                sessionId, user.getId(), correlationId);
+    }
+
+    /**
+     * Create a new session with custom TTL.
      */
     public void createSession(UUID userId, String sessionId, Object sessionData, Duration ttl) {
         String sessionKey = SESSION_PREFIX + sessionId;
@@ -47,12 +82,19 @@ public class SessionService {
     }
 
     /**
-     * Invalidate a session.
+     * Invalidate a session by session ID.
      */
     public void invalidateSession(String sessionId) {
         String sessionKey = SESSION_PREFIX + sessionId;
         redisTemplate.delete(sessionKey);
         log.debug("Invalidated session {}", sessionId);
+    }
+
+    /**
+     * Invalidate session by user ID (method needed by AuthenticationService).
+     */
+    public void invalidateSession(UUID userId) {
+        invalidateAllUserSessions(userId);
     }
 
     /**

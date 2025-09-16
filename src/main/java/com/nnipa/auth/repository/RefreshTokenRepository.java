@@ -1,6 +1,7 @@
 package com.nnipa.auth.repository;
 
 import com.nnipa.auth.entity.RefreshToken;
+import jakarta.transaction.Transactional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -37,4 +38,8 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID
     @Modifying
     @Query("DELETE FROM RefreshToken r WHERE r.expiresAt < :cutoff OR (r.revoked = true AND r.revokedAt < :cutoff)")
     void deleteExpiredTokens(@Param("cutoff") LocalDateTime cutoff);
+
+    @Modifying
+    @Transactional
+    void deleteByUserId(UUID userId);
 }
