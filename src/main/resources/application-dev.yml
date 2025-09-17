@@ -1,4 +1,5 @@
 server:
+  forward-headers-strategy: framework
   port: 4002
 
 spring:
@@ -128,7 +129,15 @@ springdoc:
     filter: true
     operations-sorter: method
     tags-sorter: alpha
+    # Add this to use the servers from your OpenAPI config
+    urls-primary-name: Via API Gateway
   show-actuator: false
+  # Add this section to override server URL detection
+  servers:
+    - url: http://localhost:4000/api/v1/auth
+      description: Via API Gateway
+    - url: http://localhost:4002
+      description: Direct Access
 
 
 # Extended actuator endpoints for development

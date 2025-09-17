@@ -59,23 +59,23 @@ public class OpenApiConfig {
     private List<Server> servers() {
         String basePath = StringUtils.hasText(contextPath) ? contextPath : "";
 
+        Server gatewayServer = new Server()
+                .url("http://localhost:4000/api/v1/auth")
+                .description("Via API Gateway");
+
         Server localServer = new Server()
                 .url("http://localhost:4002" + basePath)
-                .description("Local Development Server");
+                .description("Direct Local Access");
 
         Server devServer = new Server()
-                .url("https://dev.nnipa.cloud" + basePath)
-                .description("Development Server");
-
-        Server stagingServer = new Server()
-                .url("https://staging.nnipa.cloud" + basePath)
-                .description("Staging Server");
+                .url("https://dev-api.nnipa.cloud/api/v1/auth")
+                .description("Development Server (via Gateway)");
 
         Server prodServer = new Server()
-                .url("https://api.nnipa.cloud" + basePath)
-                .description("Production Server");
+                .url("https://api.nnipa.cloud/api/v1/auth")
+                .description("Production Server (via Gateway)");
 
-        return Arrays.asList(localServer, devServer, stagingServer, prodServer);
+        return Arrays.asList(gatewayServer, localServer, devServer, prodServer);
     }
 
     private Components components() {
