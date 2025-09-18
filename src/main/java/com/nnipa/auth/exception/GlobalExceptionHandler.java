@@ -78,6 +78,27 @@ public class GlobalExceptionHandler {
                         .build());
     }
 
+    /**
+     * Handle password policy violations and other IllegalArgumentExceptions
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ApiResponse<Object>> handleIllegalArgumentException(
+            IllegalArgumentException ex, WebRequest request) {
+        String message = ex.getMessage();
+
+        // Check if this is a password policy violation
+        if (message != null && message.toLowerCase().contains("password policy violations")) {
+            log.warn("Password policy violation: {}", message);
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponse.error(message, "PASSWORD_POLICY_VIOLATION"));
+        }
+
+        // Handle other IllegalArgumentExceptions
+        log.error("Illegal argument: {}", message);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(message != null ? message : "Invalid request parameters", "INVALID_ARGUMENT"));
+    }
+
     @ExceptionHandler(BadCredentialsException.class)
     public ResponseEntity<ApiResponse<Object>> handleBadCredentialsException(
             BadCredentialsException ex, WebRequest request) {

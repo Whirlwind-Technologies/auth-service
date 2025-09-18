@@ -14,7 +14,9 @@ import com.nnipa.auth.exception.AuthenticationException;
 import com.nnipa.auth.exception.InvalidTokenException;
 import com.nnipa.auth.repository.*;
 import com.nnipa.auth.security.jwt.JwtTokenProvider;
+import com.nnipa.auth.util.CorrelationIdUtil;
 import com.nnipa.proto.auth.AuthenticationEvent;
+import com.nnipa.proto.tenant.CreateTenantCommand;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
@@ -60,6 +62,7 @@ public class AuthenticationService {
     private final TokenBlacklistService tokenBlacklistService;
     private final PasswordPolicyService passwordPolicyService;
     private final AccountLockoutService accountLockoutService;
+    private final CorrelationIdUtil correlationIdUtil;
 
     /**
      * Authenticate user with production security features.
@@ -213,7 +216,7 @@ public class AuthenticationService {
         credentialRepository.save(credential);
 
         // Send activation email
-        publishUserEvent(user.getId(), tenantId, "USER_REGISTERED", correlationId, Map.of(
+        publishUserEvent(user.getId(), tenantId, "USER-REGISTERED", correlationId, Map.of(
                 "email", user.getEmail(),
                 "activation_required", true
         ));
@@ -460,16 +463,103 @@ public class AuthenticationService {
     }
 
     private void publishTenantCreationCommand(RegisterRequest request, String correlationId) {
-        // Publish tenant creation command to Kafka
-        Map<String, Object> command = Map.of(
-                "organization_name", request.getOrganizationName(),
-                "organization_email", request.getOrganizationEmail(),
-                "correlation_id", correlationId,
-                "timestamp", System.currentTimeMillis()
-        );
+        try {
+            log.debug("Publishing tenant creation command for organization: {} with correlation ID: {}",
+                    request.getOrganizationName(), correlationId);
 
-        // Convert to protobuf and send
-        // This would use the tenant command proto
+            // Build CommandMetadata
+            com.nnipa.proto.common.CommandMetadata metadata =
+                    com.nnipa.proto.common.CommandMetadata.newBuilder()
+                            .setCommandId(UUID.randomUUID().toString())
+                            .setCorrelationId(correlationId)
+                            .setTimestamp(com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(System.currentTimeMillis() / 1000)
+                                    .setNanos((int) ((System.currentTimeMillis() % 1000) * 1000000))
+                                    .build())
+                            .setSource("auth-service")
+                            .build();
+
+            // Build TenantDetails
+            CreateTenantCommand.TenantDetails.Builder detailsBuilder =
+                    CreateTenantCommand.TenantDetails.newBuilder()
+                            .setCode(generateTenantCode(request.getOrganizationName()))
+                            .setName(request.getOrganizationName())
+                            .setOrganizationType("SELF_SIGNUP") // Since this is from self-signup
+                            .setSubscriptionPlan("FREE") // Default plan for self-signup
+                            .setIsolationStrategy("SHARED") // Default isolation strategy
+                            .setAdminEmail(request.getEmail())
+                            .setBillingEmail(request.getOrganizationEmail() != null ?
+                                    request.getOrganizationEmail() : request.getEmail());
+
+            // Add metadata
+            detailsBuilder.putMetadata("created_by", "self_signup");
+            detailsBuilder.putMetadata("user_email", request.getEmail());
+            detailsBuilder.putMetadata("username", request.getUsername());
+            if (request.getOrganizationEmail() != null) {
+                detailsBuilder.putMetadata("organization_email", request.getOrganizationEmail());
+            }
+
+            // Add default settings
+            detailsBuilder.putSettings("max_users", "10"); // Default limit for free plan
+            detailsBuilder.putSettings("storage_limit_gb", "5"); // Default storage limit
+            detailsBuilder.putSettings("auto_provisioning", "true");
+
+            // Build the complete command
+            CreateTenantCommand command = CreateTenantCommand.newBuilder()
+                    .setMetadata(metadata)
+                    .setDetails(detailsBuilder.build())
+                    .build();
+
+            // Send to Kafka
+            String topicName = "nnipa.commands.tenant.create";
+            kafkaTemplate.send(topicName, correlationId, command.toByteArray())
+                    .whenComplete((result, ex) -> {
+                        if (ex != null) {
+                            log.error("Failed to publish tenant creation command for correlation ID: {}. Error: {}",
+                                    correlationId, ex.getMessage(), ex);
+
+                            // Could implement retry logic here or store for later processing
+                            // For now, just log the failure - the system should handle eventual consistency
+
+                        } else {
+                            log.info("Successfully published tenant creation command for correlation ID: {} to topic: {}",
+                                    correlationId, topicName);
+                        }
+                    });
+
+            log.info("Tenant creation command published successfully for organization: {} with correlation ID: {}",
+                    request.getOrganizationName(), correlationId);
+
+        } catch (Exception e) {
+            log.error("Error publishing tenant creation command for organization: {} with correlation ID: {}",
+                    request.getOrganizationName(), correlationId, e);
+            // Don't throw exception here as this is an async operation
+            // The tenant creation will be handled eventually or through retry mechanisms
+        }
+    }
+
+
+    /**
+     * Generate a unique tenant code from organization name
+     */
+    private String generateTenantCode(String organizationName) {
+        // Create a code from organization name: lowercase, replace spaces with hyphens,
+        // remove special characters, and add random suffix to ensure uniqueness
+        String baseCode = organizationName.toLowerCase()
+                .replaceAll("[^a-z0-9\\s]", "") // Remove special characters
+                .replaceAll("\\s+", "-") // Replace spaces with hyphens
+                .replaceAll("-+", "-") // Replace multiple hyphens with single
+                .replaceAll("^-|-$", ""); // Remove leading/trailing hyphens
+
+        // Limit length and add random suffix
+        if (baseCode.length() > 20) {
+            baseCode = baseCode.substring(0, 20);
+        }
+
+        // Add random suffix to ensure uniqueness
+        String randomSuffix = UUID.randomUUID().toString().substring(0, 8);
+
+        return baseCode + "-" + randomSuffix;
     }
 
     private void logSecurityEvent(SecurityEventType eventType, String username, String ipAddress, String correlationId) {
@@ -477,14 +567,7 @@ public class AuthenticationService {
     }
 
     private String getCorrelationId() {
-        RequestAttributes attributes = RequestContextHolder.getRequestAttributes();
-        if (attributes != null) {
-            Object correlationId = attributes.getAttribute("correlation-id", RequestAttributes.SCOPE_REQUEST);
-            if (correlationId != null) {
-                return correlationId.toString();
-            }
-        }
-        return UUID.randomUUID().toString();
+        return correlationIdUtil.getCorrelationId();
     }
 
     private RegistrationType determineRegistrationType(RegisterRequest request) {

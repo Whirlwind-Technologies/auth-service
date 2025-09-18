@@ -133,7 +133,7 @@ public class AuthEventPublisher {
     /**
      * Send command to create user profile.
      */
-    public CompletableFuture<SendResult<String, byte[]>> sendCreateUserProfileCommand(
+    public void sendCreateUserProfileCommand(
             UUID userId, UUID tenantId, String email, String firstName, String lastName) {
 
         CreateUserProfileCommand command = CreateUserProfileCommand.newBuilder()
@@ -148,13 +148,13 @@ public class AuthEventPublisher {
         String key = userId.toString();
         byte[] value = command.toByteArray();
 
-        return kafkaTemplate.send("nnipa.commands.user.create-profile", key, value);
+        kafkaTemplate.send("nnipa.commands.user.create-profile", key, value);
     }
 
     /**
      * Send command to assign role.
      */
-    public CompletableFuture<SendResult<String, byte[]>> sendAssignRoleCommand(
+    public void sendAssignRoleCommand(
             UUID userId, UUID tenantId, String role) {
 
         AssignRoleCommand command = AssignRoleCommand.newBuilder()
@@ -167,7 +167,7 @@ public class AuthEventPublisher {
         String key = userId.toString();
         byte[] value = command.toByteArray();
 
-        return kafkaTemplate.send("nnipa.commands.authz.assign-role", key, value);
+        kafkaTemplate.send("nnipa.commands.authz.assign-role", key, value);
     }
 
     private EventMetadata createEventMetadata() {
