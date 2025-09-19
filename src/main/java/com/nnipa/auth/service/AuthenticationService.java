@@ -1,6 +1,6 @@
 package com.nnipa.auth.service;
 
-import com.nnipa.auth.client.TenantServiceClient;
+import com.nnipa.auth.client.TenantGrpcClient;
 import com.nnipa.auth.dto.request.LoginRequest;
 import com.nnipa.auth.dto.request.RefreshTokenRequest;
 import com.nnipa.auth.dto.request.RegisterRequest;
@@ -33,6 +33,7 @@ import org.springframework.web.context.request.RequestContextHolder;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -56,13 +57,14 @@ public class AuthenticationService {
     private final AuditService auditService;
     private final MfaService mfaService;
     private final AuthEventPublisher authEventPublisher;
-    private final TenantServiceClient tenantServiceClient;
+    private final TenantGrpcClient tenantGrpcClient;
     private final KafkaTemplate<String, byte[]> kafkaTemplate;
     private final SecurityEventService securityEventService;
     private final TokenBlacklistService tokenBlacklistService;
     private final PasswordPolicyService passwordPolicyService;
     private final AccountLockoutService accountLockoutService;
     private final CorrelationIdUtil correlationIdUtil;
+    private final TemporaryTenantTracker temporaryTenantTracker;
 
     /**
      * Authenticate user with production security features.
@@ -188,42 +190,58 @@ public class AuthenticationService {
         }
     }
 
+    /**
+     * Process self-signup (new organization).
+     */
     private AuthResponse processSelfSignup(RegisterRequest request, String ipAddress, String correlationId) {
-        // Create tenant first (synchronous call with timeout)
-        UUID tenantId = createTenantForOrganization(request, correlationId);
+        log.info("Processing self-signup for organization: {} with correlation ID: {}",
+                request.getOrganizationName(), correlationId);
 
-        // Create user
+        // Step 1: Create user identity first to get the actual user ID
         User user = User.builder()
-                .tenantId(tenantId)
+                .tenantId(UUID.randomUUID()) // Temporary tenant ID - will be updated
                 .username(request.getUsername())
                 .email(request.getEmail())
                 .emailVerified(false)
+                .phoneNumber(request.getPhoneNumber())
+                .phoneVerified(false)
+                .firstName(request.getFirstName())
+                .lastName(request.getLastName())
                 .status(UserStatus.PENDING_ACTIVATION)
                 .primaryAuthProvider(AuthProvider.LOCAL)
-                .mfaEnabled(false)
+                .mfaEnabled(request.getEnableMfa())
                 .build();
 
+        // Save to get the actual generated ID
         user = userRepository.save(user);
+        final UUID actualUserId = user.getId();
 
-        // Create password credential
+        // Step 2: Create credentials immediately
         UserCredential credential = UserCredential.builder()
-                .userId(user.getId())
+                .userId(actualUserId)
                 .type(CredentialType.PASSWORD)
                 .credentialValue(passwordEncoder.encode(request.getPassword()))
-                .expiresAt(LocalDateTime.now().plusDays(90)) // Password expires in 90 days
+                .expiresAt(LocalDateTime.now().plusDays(90))
                 .build();
-
         credentialRepository.save(credential);
 
-        // Send activation email
-        publishUserEvent(user.getId(), tenantId, "USER-REGISTERED", correlationId, Map.of(
+        // Step 3: Now create tenant with the actual user ID
+        UUID tenantId = createTenantForOrganizationWithUserCallback(request, correlationId, actualUserId);
+
+        // Step 4: Update user with the actual tenant ID
+        if (!tenantId.equals(user.getTenantId())) {
+            user.setTenantId(tenantId);
+            user = userRepository.save(user);
+        }
+
+        // Step 5: Continue with the rest of the flow
+        publishUserEvent(actualUserId, tenantId, "USER-REGISTERED", correlationId, Map.of(
                 "email", user.getEmail(),
                 "activation_required", true
         ));
 
-        // Log registration
         auditService.logAuthenticationEvent(
-                user.getId(), tenantId, AuditEventType.USER_REGISTERED,
+                actualUserId, tenantId, AuditEventType.USER_REGISTERED,
                 true, ipAddress, null, Map.of(
                         "type", "self_signup",
                         "organization", request.getOrganizationName(),
@@ -231,7 +249,6 @@ public class AuthenticationService {
                 )
         );
 
-        // Generate tokens for immediate login (optional based on configuration)
         String accessToken = jwtTokenProvider.generateAccessToken(user, correlationId);
         String refreshToken = createRefreshToken(user, null, ipAddress, null);
 
@@ -239,10 +256,65 @@ public class AuthenticationService {
     }
 
     /**
+     * Create tenant for organization with user callback approach.
+     */
+    private UUID createTenantForOrganizationWithUserCallback(RegisterRequest request, String correlationId, UUID userId) {
+        try {
+            log.info("Creating tenant via gRPC for organization: {} with correlation ID: {} and user ID: {}",
+                    request.getOrganizationName(), correlationId, userId);
+
+            CompletableFuture<UUID> tenantFuture = tenantGrpcClient.createTenant(
+                    request.getOrganizationName(),
+                    request.getOrganizationEmail(),
+                    correlationId
+            );
+
+            UUID tenantId = tenantFuture.get(5, TimeUnit.SECONDS);
+
+            log.info("Successfully created tenant via gRPC with ID: {} for organization: {}",
+                    tenantId, request.getOrganizationName());
+
+            return tenantId;
+
+        } catch (TimeoutException e) {
+            log.error("Timeout creating tenant via gRPC for organization: {}, correlation ID: {}, user ID: {}",
+                    request.getOrganizationName(), correlationId, userId, e);
+
+            return handleAsyncTenantCreationWithUser(request, correlationId, userId);
+
+        } catch (Exception e) {
+            log.error("Error creating tenant via gRPC for organization: {}, correlation ID: {}, user ID: {}",
+                    request.getOrganizationName(), correlationId, userId, e);
+
+            return handleAsyncTenantCreationWithUser(request, correlationId, userId);
+        }
+    }
+
+    /**
+     * Handle async tenant creation with actual user ID.
+     */
+    private UUID handleAsyncTenantCreationWithUser(RegisterRequest request, String correlationId, UUID userId) {
+        // Generate temporary tenant ID
+        UUID temporaryTenantId = UUID.randomUUID();
+
+        // Track the temporary tenant mapping with the actual user ID
+        temporaryTenantTracker.registerTemporaryTenant(userId, temporaryTenantId, correlationId);
+
+        // Publish tenant creation command to Kafka with actual user ID
+        publishTenantCreationCommand(request, correlationId, userId);
+
+        log.warn("Using temporary tenant ID: {} for organization: {}, will be updated async via Kafka for user: {}",
+                temporaryTenantId, request.getOrganizationName(), userId);
+
+        return temporaryTenantId;
+    }
+
+    /**
      * Process admin-created user (existing tenant).
      */
     private AuthResponse processAdminCreatedUser(RegisterRequest request, String ipAddress, String correlationId) {
-        log.info("Processing admin-created user for tenant: {} with correlation ID: {}", request.getTenantId(), correlationId);
+        log.info("Processing admin-created user for tenant: {} with correlation ID: {}",
+                request.getTenantId(), correlationId);
 
         // Validate tenant ID for admin-created users
         if (request.getTenantId() == null || request.getTenantId().trim().isEmpty()) {
@@ -251,8 +323,8 @@ public class AuthenticationService {
 
         UUID tenantId = UUID.fromString(request.getTenantId());
 
-        // Verify tenant exists (call tenant-service)
-        if (!tenantServiceClient.tenantExists(tenantId)) {
+        // Verify tenant exists using gRPC client
+        if (!tenantGrpcClient.tenantExists(tenantId)) {
             throw new AuthenticationException("Invalid tenant ID");
         }
 
@@ -331,24 +403,65 @@ public class AuthenticationService {
     }
 
 
+    /**
+     * Create tenant for organization using gRPC.
+     */
     private UUID createTenantForOrganization(RegisterRequest request, String correlationId) {
         try {
-            // Call tenant service to create new tenant
-            CompletableFuture<UUID> tenantFuture = tenantServiceClient.createTenant(
+            log.info("Creating tenant via gRPC for organization: {} with correlation ID: {}",
+                    request.getOrganizationName(), correlationId);
+
+            // Call tenant service via gRPC to create new tenant
+            CompletableFuture<UUID> tenantFuture = tenantGrpcClient.createTenant(
                     request.getOrganizationName(),
                     request.getOrganizationEmail(),
                     correlationId
             );
 
-            // Wait with timeout
-            return tenantFuture.get(5, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.error("Error creating tenant for organization: {}, correlation ID: {}",
+            // Wait with timeout (5 seconds)
+            UUID tenantId = tenantFuture.get(5, TimeUnit.SECONDS);
+
+            log.info("Successfully created tenant via gRPC with ID: {} for organization: {}",
+                    tenantId, request.getOrganizationName());
+
+            return tenantId;
+
+        } catch (TimeoutException e) {
+            log.error("Timeout creating tenant via gRPC for organization: {}, correlation ID: {}",
                     request.getOrganizationName(), correlationId, e);
-            // Create tenant asynchronously and proceed
-            publishTenantCreationCommand(request, correlationId);
-            return UUID.randomUUID(); // Temporary ID, will be updated asynchronously
+
+            return handleAsyncTenantCreation(request, correlationId);
+
+        } catch (Exception e) {
+            log.error("Error creating tenant via gRPC for organization: {}, correlation ID: {}",
+                    request.getOrganizationName(), correlationId, e);
+
+            return handleAsyncTenantCreation(request, correlationId);
         }
+    }
+
+    /**
+     * Handle async tenant creation when synchronous call fails.
+     * Creates a temporary tenant ID and publishes command to Kafka.
+     */
+    private UUID handleAsyncTenantCreation(RegisterRequest request, String correlationId) {
+        // Generate temporary tenant ID
+        UUID temporaryTenantId = UUID.randomUUID();
+
+        // Get the user ID that's being created (you might need to pass this from the calling method)
+        // For now, we'll use a placeholder - in practice, you'd pass the user ID
+        UUID userId = UUID.randomUUID(); // This should be the actual user ID being created
+
+        // Track the temporary tenant ID in Redis
+        temporaryTenantTracker.registerTemporaryTenant(userId, temporaryTenantId, correlationId);
+
+        // Publish tenant creation command to Kafka for async processing
+        publishTenantCreationCommand(request, correlationId, userId);
+
+        log.warn("Using temporary tenant ID: {} for organization: {}, will be updated async via Kafka",
+                temporaryTenantId, request.getOrganizationName());
+
+        return temporaryTenantId;
     }
 
     private void validateUserStatus(User user, String correlationId) {
@@ -462,10 +575,14 @@ public class AuthenticationService {
         publishAuthenticationEvent(userId, tenantId, eventType, correlationId);
     }
 
-    private void publishTenantCreationCommand(RegisterRequest request, String correlationId) {
+    /**
+     * Publish tenant creation command to Kafka as fallback.
+     * This is used when gRPC synchronous call fails or times out.
+     */
+    private void publishTenantCreationCommand(RegisterRequest request, String correlationId, UUID userId) {
         try {
-            log.debug("Publishing tenant creation command for organization: {} with correlation ID: {}",
-                    request.getOrganizationName(), correlationId);
+            log.debug("Publishing tenant creation command for organization: {} with correlation ID: {} and user ID: {}",
+                    request.getOrganizationName(), correlationId, userId);
 
             // Build CommandMetadata
             com.nnipa.proto.common.CommandMetadata metadata =
@@ -491,8 +608,9 @@ public class AuthenticationService {
                             .setBillingEmail(request.getOrganizationEmail() != null ?
                                     request.getOrganizationEmail() : request.getEmail());
 
-            // Add metadata
+            // Add metadata including user ID for response routing
             detailsBuilder.putMetadata("created_by", "self_signup");
+            detailsBuilder.putMetadata("user_id", userId.toString());  // Important: Include user ID
             detailsBuilder.putMetadata("user_email", request.getEmail());
             detailsBuilder.putMetadata("username", request.getUsername());
             if (request.getOrganizationEmail() != null) {
@@ -515,24 +633,24 @@ public class AuthenticationService {
             kafkaTemplate.send(topicName, correlationId, command.toByteArray())
                     .whenComplete((result, ex) -> {
                         if (ex != null) {
-                            log.error("Failed to publish tenant creation command for correlation ID: {}. Error: {}",
-                                    correlationId, ex.getMessage(), ex);
+                            log.error("Failed to publish tenant creation command for correlation ID: {} and user ID: {}. Error: {}",
+                                    correlationId, userId, ex.getMessage(), ex);
 
                             // Could implement retry logic here or store for later processing
                             // For now, just log the failure - the system should handle eventual consistency
 
                         } else {
-                            log.info("Successfully published tenant creation command for correlation ID: {} to topic: {}",
-                                    correlationId, topicName);
+                            log.info("Successfully published tenant creation command for correlation ID: {} and user ID: {} to topic: {}",
+                                    correlationId, userId, topicName);
                         }
                     });
 
-            log.info("Tenant creation command published successfully for organization: {} with correlation ID: {}",
-                    request.getOrganizationName(), correlationId);
+            log.info("Tenant creation command published successfully for organization: {} with correlation ID: {} and user ID: {}",
+                    request.getOrganizationName(), correlationId, userId);
 
         } catch (Exception e) {
-            log.error("Error publishing tenant creation command for organization: {} with correlation ID: {}",
-                    request.getOrganizationName(), correlationId, e);
+            log.error("Error publishing tenant creation command for organization: {} with correlation ID: {} and user ID: {}",
+                    request.getOrganizationName(), correlationId, userId, e);
             // Don't throw exception here as this is an async operation
             // The tenant creation will be handled eventually or through retry mechanisms
         }

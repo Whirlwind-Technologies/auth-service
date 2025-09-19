@@ -98,7 +98,7 @@ public class KafkaConfig {
     @Bean
     public NewTopic createTenantCommandTopic() {
         return TopicBuilder.name("nnipa.commands.tenant.create")
-                .partitions(3)
+                .partitions(6)
                 .replicas(1)
                 .build();
     }

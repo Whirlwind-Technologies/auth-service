@@ -9,12 +9,14 @@ import org.hibernate.annotations.SQLDelete;
 import org.hibernate.annotations.Where;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 /**
- * User entity - fixed version with MFA type support
+ * User entity - fixed version with MFA type support and metadata
  */
 @Entity
 @Table(name = "users", indexes = {
@@ -73,7 +75,7 @@ public class User extends BaseEntity {
 
     @Enumerated(EnumType.STRING)
     @Column(name = "mfa_type", length = 30)
-    private MfaType mfaType; // Added this field
+    private MfaType mfaType;
 
     @Column(name = "mfa_secret")
     private String mfaSecret;
@@ -101,6 +103,16 @@ public class User extends BaseEntity {
 
     @Column(name = "deleted_at")
     private LocalDateTime deletedAt;
+
+    @ElementCollection(fetch = FetchType.LAZY)
+    @CollectionTable(
+            name = "user_metadata",
+            joinColumns = @JoinColumn(name = "user_id")
+    )
+    @MapKeyColumn(name = "metadata_key")
+    @Column(name = "metadata_value")
+    @Builder.Default
+    private Map<String, String> metadata = new HashMap<>();
 
     // Relationships
     @OneToMany(mappedBy = "user", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
@@ -150,5 +162,23 @@ public class User extends BaseEntity {
                 .map(MfaDevice::getType)
                 .findFirst()
                 .orElse(MfaType.TOTP); // Default fallback
+    }
+
+    // ADDED: Metadata convenience methods
+    public void putMetadata(String key, String value) {
+        if (this.metadata == null) {
+            this.metadata = new HashMap<>();
+        }
+        this.metadata.put(key, value);
+    }
+
+    public String getMetadata(String key) {
+        return this.metadata != null ? this.metadata.get(key) : null;
+    }
+
+    public void removeMetadata(String key) {
+        if (this.metadata != null) {
+            this.metadata.remove(key);
+        }
     }
 }

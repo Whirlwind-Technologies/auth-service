@@ -35,19 +35,37 @@ spring:
         linger.ms: 10
         batch.size: 32768
     consumer:
-      group-id: notification-service
+      group-id: auth-service
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: io.confluent.kafka.serializers.protobuf.KafkaProtobufDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
       auto-offset-reset: earliest
       enable-auto-commit: false
       properties:
-        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://schema-registry:8081}
-        specific.protobuf.value.type: com.google.protobuf.DynamicMessage
         isolation.level: read_committed
         session.timeout.ms: 30000
         heartbeat.interval.ms: 10000
         max.poll.records: 10
         max.poll.interval.ms: 300000
+
+  # Disable gRPC security auto-configuration
+  autoconfigure:
+    exclude:
+      - net.devh.boot.grpc.server.autoconfigure.GrpcServerSecurityAutoConfiguration
+
+grpc:
+  client:
+    tenant-service:
+      address: 'static://tenant-service:9091'  # Use Kubernetes service name
+      enable-keep-alive: true
+      keep-alive-without-calls: true
+      negotiation-type: plaintext  # Use TLS in production
+      max-inbound-message-size: 4194304  # 4MB
+
+    # Optional: Global client configuration
+    GLOBAL:
+      enable-keep-alive: true
+      keep-alive-time: 30s
+      keep-alive-timeout: 5s
 
 # Event Topics Configuration
 auth:
@@ -101,6 +119,9 @@ services:
 logging:
   level:
     root: INFO
+    io.grpc: INFO
+    net.devh.boot.grpc: DEBUG
+    com.nnipa.auth.client: DEBUG
     com.nnipa.auth: DEBUG
     org.springframework.security: DEBUG
     org.springframework.security.oauth2: DEBUG
