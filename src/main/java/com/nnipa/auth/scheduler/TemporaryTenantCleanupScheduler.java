@@ -2,6 +2,7 @@ package com.nnipa.auth.scheduler;
 
 import com.nnipa.auth.service.TemporaryTenantTracker;
 import com.nnipa.auth.repository.UserRepository;
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -67,10 +68,11 @@ public class TemporaryTenantCleanupScheduler {
     /**
      * Handle a stale temporary tenant.
      */
-    private void handleStaleTenant(UUID tempTenantId) {
+    @Transactional
+    protected void handleStaleTenant(UUID tempTenantId) {
         try {
-            // Find users with this temporary tenant ID
-            var users = userRepository.findByTenantId(tempTenantId);
+            //// Find users with this temporary tenant ID. Use eager-fetching query
+            var users = userRepository.findByTenantIdWithMetadata(tempTenantId);
 
             if (users.isEmpty()) {
                 log.debug("No users found with temporary tenant ID: {}, removing from tracker",

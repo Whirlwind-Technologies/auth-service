@@ -192,6 +192,7 @@ public class AuthenticationService {
 
     /**
      * Process self-signup (new organization).
+     * Email verification is required by default for self-signup users.
      */
     private AuthResponse processSelfSignup(RegisterRequest request, String ipAddress, String correlationId) {
         log.info("Processing self-signup for organization: {} with correlation ID: {}",
@@ -225,19 +226,30 @@ public class AuthenticationService {
                 .build();
         credentialRepository.save(credential);
 
-        // Step 3: Now create tenant with the actual user ID
+        // Step 3: Generate and set activation token
+        String activationToken = UUID.randomUUID().toString();
+        user.setActivationToken(activationToken);
+        user.setActivationTokenExpiresAt(LocalDateTime.now().plusDays(7));
+
+        // Step 4: Now create tenant with the actual user ID
         UUID tenantId = createTenantForOrganizationWithUserCallback(request, correlationId, actualUserId);
 
-        // Step 4: Update user with the actual tenant ID
+        // Step 5: Update user with the actual tenant ID
         if (!tenantId.equals(user.getTenantId())) {
             user.setTenantId(tenantId);
-            user = userRepository.save(user);
         }
 
-        // Step 5: Continue with the rest of the flow
+        // Save user with activation token and tenant ID
+        user = userRepository.save(user);
+
+        // Step 6: Send activation email
+//        authEventPublisher.sendActivationEmail(user.getEmail(), activationToken, user.getFirstName());
+
+        // Step 7: Log events
         publishUserEvent(actualUserId, tenantId, "USER-REGISTERED", correlationId, Map.of(
                 "email", user.getEmail(),
-                "activation_required", true
+                "activation_required", true,
+                "phone_number",user.getPhoneNumber()
         ));
 
         auditService.logAuthenticationEvent(
@@ -245,14 +257,22 @@ public class AuthenticationService {
                 true, ipAddress, null, Map.of(
                         "type", "self_signup",
                         "organization", request.getOrganizationName(),
-                        "correlation_id", correlationId
+                        "correlation_id", correlationId,
+                        "requires_activation", true
                 )
         );
 
-        String accessToken = jwtTokenProvider.generateAccessToken(user, correlationId);
-        String refreshToken = createRefreshToken(user, null, ipAddress, null);
-
-        return buildAuthResponse(user, accessToken, refreshToken);
+        // For self-signup users, email verification is always required
+        // No tokens are generated until account is activated
+        return AuthResponse.builder()
+                .user(UserInfoResponse.builder()
+                        .id(user.getId())
+                        .email(user.getEmail())
+                        .username(user.getUsername())
+                        .status(UserStatus.PENDING_ACTIVATION)
+                        .build())
+                .authenticatedAt(LocalDateTime.now())
+                .build();
     }
 
     /**

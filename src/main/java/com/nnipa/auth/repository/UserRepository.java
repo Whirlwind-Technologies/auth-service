@@ -39,4 +39,7 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     @Query("SELECT u FROM User u WHERE u.lockedUntil < :now AND u.lockedUntil IS NOT NULL")
     List<User> findUsersToUnlock(@Param("now") LocalDateTime now);
+
+    @Query("SELECT u FROM User u LEFT JOIN FETCH u.metadata WHERE u.tenantId = :tenantId AND u.status != 'DELETED'")
+    List<User> findByTenantIdWithMetadata(@Param("tenantId") UUID tenantId);
 }
