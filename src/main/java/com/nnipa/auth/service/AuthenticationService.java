@@ -286,7 +286,8 @@ public class AuthenticationService {
             CompletableFuture<UUID> tenantFuture = tenantGrpcClient.createTenant(
                     request.getOrganizationName(),
                     request.getOrganizationEmail(),
-                    correlationId
+                    correlationId,
+                    userId
             );
 
             UUID tenantId = tenantFuture.get(5, TimeUnit.SECONDS);
@@ -426,7 +427,7 @@ public class AuthenticationService {
     /**
      * Create tenant for organization using gRPC.
      */
-    private UUID createTenantForOrganization(RegisterRequest request, String correlationId) {
+    private UUID createTenantForOrganization(RegisterRequest request, String correlationId, UUID userId) {
         try {
             log.info("Creating tenant via gRPC for organization: {} with correlation ID: {}",
                     request.getOrganizationName(), correlationId);
@@ -435,7 +436,8 @@ public class AuthenticationService {
             CompletableFuture<UUID> tenantFuture = tenantGrpcClient.createTenant(
                     request.getOrganizationName(),
                     request.getOrganizationEmail(),
-                    correlationId
+                    correlationId,
+                    userId
             );
 
             // Wait with timeout (5 seconds)
@@ -621,8 +623,8 @@ public class AuthenticationService {
                     CreateTenantCommand.TenantDetails.newBuilder()
                             .setCode(generateTenantCode(request.getOrganizationName()))
                             .setName(request.getOrganizationName())
-                            .setOrganizationType("SELF_SIGNUP") // Since this is from self-signup
-                            .setSubscriptionPlan("FREE") // Default plan for self-signup
+                            .setOrganizationType(request.getOrganizationType()) // Since this is from self-signup
+                            .setSubscriptionPlan("FREEMIUM") // Default plan for self-signup
                             .setIsolationStrategy("SHARED") // Default isolation strategy
                             .setAdminEmail(request.getEmail())
                             .setBillingEmail(request.getOrganizationEmail() != null ?

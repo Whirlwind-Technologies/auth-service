@@ -105,7 +105,7 @@ public class TenantGrpcClient {
      */
     public CompletableFuture<UUID> createTenant(String organizationName,
                                                 String organizationEmail,
-                                                String correlationId) {
+                                                String correlationId, UUID userId) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 log.info("Creating tenant via gRPC for organization: {} with correlationId: {}",
@@ -118,9 +118,9 @@ public class TenantGrpcClient {
                         .setName(organizationName)
                         .setEmail(organizationEmail)
                         .setTenantCode(tenantCode)
-                        .setOrganizationType("ENTERPRISE")  // Default, you can make this configurable
-                        .setSubscriptionPlan("FREE")        // Default plan for self-signup
-                        .setCreatedBy("SELF_SIGNUP")
+                        .setOrganizationType("ENTERPRISE")
+                        .setSubscriptionPlan("FREEMIUM")        // Default plan for self-signup
+                        .setCreatedBy(userId.toString())
                         .setCorrelationId(correlationId)
                         .build();
 
